@@ -12,6 +12,7 @@ into the testable engine modules (:mod:`cloud.ec2`, :mod:`cloud.iam`,
 
 from __future__ import annotations
 
+import dataclasses
 import secrets
 import threading
 import time
@@ -21,7 +22,8 @@ from typing import Optional
 from kiro_crew.cloud import connect as connect_mod
 from kiro_crew.cloud import ec2, iam, login, sizes, ssm, ui
 from kiro_crew.cloud.aws import AWSError
-from kiro_crew.cloud.config import DEFAULT_REGION, CloudConfig
+from kiro_crew.cloud.config import DEFAULT_REGION
+from kiro_crew.cloud.launch_state import LaunchState
 from kiro_crew.cloud.login_target import KiroLoginTarget, LoginTargetError
 from kiro_crew.validation import ValidationError
 
@@ -360,7 +362,7 @@ def launch(
     wizard is embedded in a larger flow (``kirocrew setup``) that still has
     steps to print after this one.
     """
-    cfg = CloudConfig.load()
+    cfg = LaunchState.load()
     profile = profile or cfg.profile
     region = region or cfg.region or DEFAULT_REGION
     target = login_target or KiroLoginTarget()
@@ -508,10 +510,10 @@ def launch(
         # would leave cloud.json pointing at a ROLLBACK_COMPLETE / no-instance
         # stack on a failed first launch, and the NEXT `launch` would then treat
         # that broken stack as the saved deployment and abort at "instance not
-        # ready" instead of cleanly creating a new one. We set the in-memory
-        # fields (so progress streaming + failure diagnostics have the tag) but
-        # only `cfg.save()` AFTER a confirmed-healthy deploy below.
-        cfg.profile, cfg.region, cfg.last_tag = profile, region, tag
+        # ready" instead of cleanly creating a new one. We hold the fields in memory (so
+        # progress streaming + failure diagnostics have the tag) and only write the launch
+        # record AFTER a confirmed-healthy deploy below.
+        cfg = dataclasses.replace(cfg, profile=profile, region=region, last_tag=tag)
         ui.info("Provisioning EC2 + installing KiroCrew (this takes a few minutes)…")
         try:
             result = _deploy_with_progress(
@@ -545,8 +547,13 @@ def launch(
             return 1
         # Deploy succeeded (WaitCondition confirmed the gateway healthy) — NOW it
         # is safe to persist the tag as the saved deployment.
-        cfg.profile, cfg.region, cfg.last_tag = profile, region, tag
-        cfg.save()
+        #
+        # Into the LAUNCH RECORD, which this path owns, and not into `cloud.json`, which the
+        # operator owns and may have open in an editor. Writing there had to choose between
+        # overwriting their `fargate` block and refusing, and a refusal lands HERE -- after
+        # the instance is deployed and billing, before sign-in and dashboard setup -- so the
+        # command aborted over a file it did not need to write at all.
+        _record_launch(profile=profile, region=region, tag=tag)
         ui.ok(f"Instance {result.instance_id} is up and KiroCrew is healthy.")
     elif not result.instance_id:
         ui.warn("Previous cloud stack exists but the instance is not ready yet.")
@@ -739,8 +746,30 @@ def _ensure_session_manager_plugin(*, assume_yes: bool = False) -> bool:
     return False
 
 
+def _record_launch(*, profile: str, region: str, tag: str) -> None:
+    """Write the launch record, and never fail the command over it.
+
+    Every caller runs AFTER its remote work: the instance is deployed and billing, or the
+    resume has already reattached. Sign-in, the dashboard tunnel and the closing instructions
+    still have to happen, and all of them matter more to the operator than a pointer file.
+
+    So a write failure warns and the wizard continues. Nothing is silently lost: the warning
+    names the tag, and `kirocrew cloud list` enumerates the real stacks, so the instance is
+    findable and re-attachable by tag even with no pointer on disk. The reverse -- aborting
+    here -- leaves a running instance whose sign-in never happened.
+
+    Narrow on purpose. Only `OSError` is swallowed, which is what a disk or permission
+    failure raises; anything else is a defect in this code and must surface.
+    """
+    try:
+        LaunchState.record(profile=profile, region=region, last_tag=tag)
+    except OSError as exc:
+        ui.warn(f"Could not save the launch record: {exc}")
+        ui.detail(f"The instance is up. Reach it with: kirocrew cloud connect --tag {tag}")
+
+
 def _select_existing_launch(
-    cfg: CloudConfig,
+    cfg: LaunchState,
     profile: str,
     region: str,
     *,
@@ -759,14 +788,17 @@ def _select_existing_launch(
     result = _resume_tag(selected.tag, profile, region)
     if result is None:
         return None
-    cfg.profile, cfg.region, cfg.last_tag = profile, region, selected.tag
+    cfg = dataclasses.replace(cfg, profile=profile, region=region, last_tag=selected.tag)
     if not selected.saved:
-        cfg.save()
+        # The launch record, for the reason the post-deploy write uses it: this runs after
+        # the resume has already reattached, so a write that can fail must not be a write
+        # that can fail the command.
+        _record_launch(profile=profile, region=region, tag=selected.tag)
     return result
 
 
 def _discover_existing_launches(
-    cfg: CloudConfig, profile: str, region: str
+    cfg: LaunchState, profile: str, region: str
 ) -> list[_ExistingLaunch]:
     """Find resumable stacks from saved state or CloudFormation discovery."""
     launches: list[_ExistingLaunch] = []
@@ -811,7 +843,7 @@ def _discover_existing_launches(
 
 
 def _choose_existing_launch(
-    launches: list[_ExistingLaunch], cfg: CloudConfig, *, assume_yes: bool = False
+    launches: list[_ExistingLaunch], cfg: LaunchState, *, assume_yes: bool = False
 ) -> _ExistingLaunch | None:
     """Return the stack the user chose to keep, or None to create a new one."""
     if not launches:
@@ -861,7 +893,7 @@ def _choose_existing_launch(
 
 
 def _preferred_existing_launch(
-    launches: list[_ExistingLaunch], cfg: CloudConfig
+    launches: list[_ExistingLaunch], cfg: LaunchState
 ) -> _ExistingLaunch:
     """Prefer the saved launch when non-interactive defaults are accepted."""
     if cfg.last_tag:
@@ -892,7 +924,7 @@ def _deploy_result_for_tag(tag: str, profile: str, region: str) -> ec2.DeployRes
     )
 
 
-def _saved_launch_matches(cfg: CloudConfig, profile: str, region: str) -> bool:
+def _saved_launch_matches(cfg: LaunchState, profile: str, region: str) -> bool:
     return (cfg.profile or "") == (profile or "") and (cfg.region or DEFAULT_REGION) == region
 
 

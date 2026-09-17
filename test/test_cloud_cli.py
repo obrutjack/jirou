@@ -11,6 +11,7 @@ from kiro_crew import cli_cloud
 from kiro_crew.cloud import connect as connect_mod
 from kiro_crew.cloud import ec2
 from kiro_crew.cloud.config import CloudConfig
+from kiro_crew.cloud.launch_state import LaunchState
 
 
 def _args(**kw):
@@ -246,7 +247,7 @@ class TestDestroy:
         monkeypatch.setattr(
             CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig(last_tag="kc-1"))
         )
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(LaunchState, "record", classmethod(lambda cls, **k: None))
         rc = cli_cloud._cloud_destroy(
             _args(profile="", region="", tag="kc-1", dry_run=False, yes=True)
         )
@@ -277,7 +278,7 @@ class TestDestroy:
         monkeypatch.setattr(
             CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig(last_tag="kc-1"))
         )
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(LaunchState, "record", classmethod(lambda cls, **k: None))
         rc = cli_cloud._cloud_destroy(
             _args(profile="", region="", tag="kc-1", dry_run=False, yes=True)
         )
@@ -304,7 +305,11 @@ class TestDestroy:
         monkeypatch.setattr(
             CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig(last_tag="kc-1"))
         )
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: saved.update(n=saved["n"] + 1))
+        monkeypatch.setattr(
+            LaunchState,
+            "record",
+            classmethod(lambda cls, **k: saved.update(n=saved["n"] + 1)),
+        )
         monkeypatch.setattr(connect_mod, "unregister_instance", lambda *a, **k: True)
 
         rc = cli_cloud._cloud_destroy(

@@ -20,7 +20,8 @@ from kiro_crew.cloud import ec2, iam
 from kiro_crew.cloud import login as login_mod
 from kiro_crew.cloud import sizes, ssm, ui, wizard
 from kiro_crew.cloud.aws import AWSError, CloudActionDenied
-from kiro_crew.cloud.config import DEFAULT_REGION, CloudConfig
+from kiro_crew.cloud.config import DEFAULT_REGION
+from kiro_crew.cloud.launch_state import LaunchState
 from kiro_crew.cloud.login_target import (
     KiroLoginTarget,
     LoginTargetError,
@@ -32,10 +33,15 @@ from kiro_crew.validation import ValidationError
 
 
 def _resolve(args: argparse.Namespace) -> tuple[str, str]:
-    """Resolve (profile, region) from args, falling back to saved config."""
-    cfg = CloudConfig.load()
-    profile = getattr(args, "profile", "") or cfg.profile
-    region = getattr(args, "region", "") or cfg.region or DEFAULT_REGION
+    """Resolve (profile, region) from args, falling back to the launch record.
+
+    From ``launch_state``, not from ``cloud.json``: these two are what a LAUNCH decided, so
+    they are the launch path's to write. The record falls back to the legacy fields in
+    ``cloud.json`` when it holds none, so an install that predates it answers as it did.
+    """
+    state = LaunchState.load()
+    profile = getattr(args, "profile", "") or state.profile
+    region = getattr(args, "region", "") or state.region or DEFAULT_REGION
     return profile, region
 
 
@@ -44,12 +50,12 @@ def _resolve_tag(args: argparse.Namespace) -> str:
     tag = getattr(args, "tag", "") or ""
     if tag:
         return tag
-    cfg = CloudConfig.load()
-    if not cfg.last_tag:
+    state = LaunchState.load()
+    if not state.last_tag:
         ui.fail("No instance tag given and no previous launch found.")
         ui.detail("Pass --tag <tag>, or run `kirocrew cloud list` to see instances.")
         sys.exit(1)
-    return cfg.last_tag
+    return state.last_tag
 
 
 def _resolve_login_target(args: argparse.Namespace, *, inherit: bool) -> "KiroLoginTarget":
@@ -317,7 +323,9 @@ def _cloud_logout(args: argparse.Namespace) -> int:
         ui.detail("The session may still be active — retry, or check with: kirocrew cloud connect")
         return 1
     ui.ok("Signed out on the instance.")
-    ui.detail("Any in-flight chats/cron sessions were stopped (their kiro-cli runtimes were killed).")
+    ui.detail(
+        "Any in-flight chats/cron sessions were stopped (their kiro-cli runtimes were killed)."
+    )
     ui.detail("Sign in with another account: kirocrew cloud login")
     return 0
 
@@ -410,10 +418,15 @@ def _cloud_destroy(args: argparse.Namespace) -> int:
             ui.detail(f"Remove it manually: aws s3 rm {src['uri']}")
         if src.get("error"):
             ui.detail(src["error"])
-    cfg = CloudConfig.load()
-    if cfg.last_tag == tag:
-        cfg.last_tag = ""
-        cfg.save()
+    # The launch RECORD, not the operator's configuration: this command owns the pointer to
+    # the stack it just deleted and owns nothing in `cloud.json`.
+    #
+    # The precondition travels with the clear because this command owns the pointer only
+    # while it still names the stack it deleted: a launch that recorded its own tag in
+    # between must not have that pointer wiped by a command which never saw it. A declined
+    # clear is not an error -- it means the pointer already moved on, which is the state
+    # this command wanted.
+    LaunchState.clear_tag(tag)
 
     ui.ok(f"Removed '{tag}' — all AWS resources deleted. You won't be billed for it.")
     return 0

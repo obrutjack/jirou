@@ -7,7 +7,7 @@ import pytest
 from kiro_crew.cloud import aws
 from kiro_crew.cloud import connect as connect_mod
 from kiro_crew.cloud import ec2, iam, login, ssm, wizard
-from kiro_crew.cloud.config import CloudConfig
+from kiro_crew.cloud.launch_state import LaunchState
 
 
 def _patch_post_launch(monkeypatch, *, logged_in: bool = True) -> dict[str, list[str]]:
@@ -64,8 +64,8 @@ class TestLaunchSubnetFlag:
     def test_malformed_subnet_fails_before_any_aws_call(self, monkeypatch, capsys):
         # Validation runs before the wizard's first AWS reachability check, so a
         # typo'd --subnet renders one clean line instead of a traceback later.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.iam,
             "reachability_check",
@@ -78,8 +78,8 @@ class TestLaunchSubnetFlag:
     def test_subnet_with_existing_stack_fails_under_yes(self, monkeypatch, capsys):
         # Non-interactive: an explicitly requested pin that would be silently
         # ignored must exit early, not warn-and-proceed into the wrong network.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.iam,
             "reachability_check",
@@ -104,12 +104,12 @@ class TestLaunchSubnetFlag:
         assert "--subnet cannot apply" in capsys.readouterr().out
 
     def test_subnet_threads_through_to_deploy(self, monkeypatch):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
         _patch_post_launch(monkeypatch)
         captured = {}
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             wizard.iam,
             "reachability_check",
@@ -148,13 +148,17 @@ class TestLaunchSubnetFlag:
 
 class TestLaunchResume:
     def test_resumes_existing_saved_stack_without_deploy(self, monkeypatch, capsys):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch)
         save_calls: list[str] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig, "save", lambda self, *a: save_calls.append(self.last_tag)
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(last_tag)
+            ),
         )
         monkeypatch.setattr(
             ec2,
@@ -197,10 +201,10 @@ class TestLaunchResume:
         target = KiroLoginTarget(
             license="pro", start_url="https://example.awsapps.com/start", region="us-east-1"
         )
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -250,10 +254,10 @@ class TestLaunchResume:
         target = KiroLoginTarget(
             license="pro", start_url="https://example.awsapps.com/start", region="us-east-1"
         )
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -296,10 +300,10 @@ class TestLaunchResume:
         target = KiroLoginTarget(
             license="pro", start_url="https://example.awsapps.com/start", region="us-east-1"
         )
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -347,10 +351,10 @@ class TestLaunchResume:
         as an exit-0 "not signed in" warning."""
         from kiro_crew.cloud.login_target import KiroLoginTarget
 
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -399,7 +403,7 @@ class TestLaunchResume:
         # last_tag before the deploy confirmed: if the saved tag points at a
         # FAILED / no-instance stack, `launch` must NOT resume it (aborting at
         # "instance not ready") — it must fall through to a fresh new launch.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-broken")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-broken")
         _patch_post_launch(monkeypatch)
 
         # The stale saved stack exists but is ROLLBACK_COMPLETE with no instance.
@@ -426,8 +430,8 @@ class TestLaunchResume:
 
         monkeypatch.setattr(ec2, "describe", fake_describe)
         monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])  # no other stacks
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-fresh")
         deployed: list[str] = []
 
@@ -451,10 +455,10 @@ class TestLaunchResume:
         # `launch` after `cloud stop`: the resumed instance is STOPPED, so the
         # wizard must start it and wait for SSM Online before sign-in/tunnel
         # (which are all over SSM and would otherwise fail).
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         _patch_post_launch(monkeypatch)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -486,10 +490,10 @@ class TestLaunchResume:
     def test_resume_of_terminated_instance_fails_clean(self, monkeypatch, capsys):
         # A saved stack whose instance is terminated can't be resumed — fail with
         # a clear message pointing at --new, not an opaque SSM error.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         _patch_post_launch(monkeypatch)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -520,7 +524,7 @@ class TestLaunchResume:
     def test_hold_tunnel_false_closes_and_returns(self, monkeypatch, capsys):
         # Embedded in `kirocrew setup`, the wizard must NOT block on the
         # tunnel child — it closes it and returns so setup can finish.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         _patch_post_launch(monkeypatch)
 
         class _LiveProc:
@@ -553,8 +557,8 @@ class TestLaunchResume:
             return conn
 
         monkeypatch.setattr(connect_mod, "connect", fake_connect_with_proc)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -576,16 +580,20 @@ class TestLaunchResume:
         assert "reopen anytime" in capsys.readouterr().out
 
     def test_missing_saved_stack_falls_back_to_new_launch(self, monkeypatch):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch)
         save_calls: list[tuple[str, str, str]] = []
         deploy_calls: list[str] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(
+                    (profile, region, last_tag)
+                )
+            ),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(ec2, "describe", lambda *_a, **_k: {"exists": False})
@@ -611,12 +619,12 @@ class TestLaunchResume:
         assert save_calls == [("dev", "us-west-2", "kc-new")]
 
     def test_force_new_ignores_existing_saved_stack(self, monkeypatch):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch)
         deploy_calls: list[str] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "record", classmethod(lambda cls, **k: None))
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(
             ec2,
@@ -648,15 +656,19 @@ class TestLaunchResume:
         # A FAILED first launch must NOT persist last_tag — otherwise cloud.json
         # points at a rolled-back / no-instance stack and the next `launch`
         # resumes it and aborts at "instance not ready" instead of retrying clean.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
         _patch_post_launch(monkeypatch)
         save_calls: list[tuple[str, str, str]] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(
+                    (profile, region, last_tag)
+                )
+            ),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])
@@ -667,18 +679,55 @@ class TestLaunchResume:
         # NOTHING persisted on failure — the broken tag never reaches cloud.json.
         assert save_calls == []
 
+    def test_a_record_that_cannot_be_written_does_not_abort_the_launch(self, monkeypatch):
+        """The deploy is BILLED by the time the record is written, so the write cannot fail
+        the command.
+
+        This is the finding that moved the pointer out of ``cloud.json``: the post-deploy write
+        went into the operator's file, an unparseable one made it raise, and the command ended
+        there -- after the instance was running and before sign-in. The write is now to a file
+        the launch owns, and a failure on it warns and continues, because sign-in and the
+        dashboard tunnel matter more to the operator than a pointer.
+        """
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
+        calls = _patch_post_launch(monkeypatch)
+        warnings: list[str] = []
+
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(
+            wizard.LaunchState,
+            "record",
+            classmethod(lambda cls, **k: (_ for _ in ()).throw(OSError("read-only file system"))),
+        )
+        monkeypatch.setattr(wizard.ui, "warn", lambda msg, *a, **k: warnings.append(str(msg)))
+        monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
+        monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])
+        monkeypatch.setattr(ec2, "deploy", lambda **_k: ec2.DeployResult(True, "i-new", "", "", ""))
+
+        rc = wizard.launch(profile="dev", region="us-west-2", assume_yes=True)
+
+        assert rc == 0, "a pointer that could not be saved failed a launch that succeeded"
+        # The steps AFTER the record still ran: that is the whole point.
+        assert calls["login"], "sign-in was skipped because the pointer could not be saved"
+        # And it is not silent: the operator is told, and told how to reach the instance.
+        assert any("launch record" in w for w in warnings), warnings
+
     def test_successful_new_launch_persists_tag_after_deploy(self, monkeypatch):
         # On a SUCCESSFUL launch the tag IS persisted (so a later `launch`/status
         # can resume it) — but only after the deploy confirms.
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
         _patch_post_launch(monkeypatch)
         save_calls: list[tuple[str, str, str]] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(
+                    (profile, region, last_tag)
+                )
+            ),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])
@@ -698,15 +747,19 @@ class TestLaunchResume:
         assert ("dev", "us-west-2", "kc-new") in save_calls
 
     def test_discovers_single_stack_when_local_tag_missing(self, monkeypatch, capsys):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
         calls = _patch_post_launch(monkeypatch)
         save_calls: list[tuple[str, str, str]] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(
+                    (profile, region, last_tag)
+                )
+            ),
         )
         monkeypatch.setattr(
             ec2,
@@ -745,17 +798,21 @@ class TestLaunchResume:
         assert "Resuming existing CloudFormation stack" in capsys.readouterr().out
 
     def test_interactive_existing_stack_can_create_new_installation(self, monkeypatch, capsys):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch)
         save_calls: list[tuple[str, str, str]] = []
         deploy_calls: list[str] = []
         choices: list[tuple[str, list[tuple[str, str]]]] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(
+                    (profile, region, last_tag)
+                )
+            ),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(
@@ -800,16 +857,20 @@ class TestLaunchResume:
         assert "existing stack is unchanged" in capsys.readouterr().out
 
     def test_interactive_multiple_discovered_stacks_can_choose_one(self, monkeypatch):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
         calls = _patch_post_launch(monkeypatch)
         save_calls: list[tuple[str, str, str]] = []
         choices: list[tuple[str, list[tuple[str, str]]]] = []
 
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            wizard.LaunchState,
+            "record",
+            classmethod(
+                lambda cls, *, profile, region, last_tag, path=None: save_calls.append(
+                    (profile, region, last_tag)
+                )
+            ),
         )
         monkeypatch.setattr(
             ec2,
@@ -860,9 +921,9 @@ class TestLaunchResume:
         ]
 
     def test_multiple_discovered_stacks_fail_safe(self, monkeypatch, capsys):
-        cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="")
+        cfg = LaunchState(profile="dev", region="us-west-2", last_tag="")
         _patch_post_launch(monkeypatch)
-        monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
+        monkeypatch.setattr(wizard.LaunchState, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             ec2,
             "list_stacks",
@@ -1004,8 +1065,8 @@ class TestSizeKeyGuard:
         # uncaught KeyError traceback.
         _patch_post_launch(monkeypatch)
         monkeypatch.setattr(wizard.ec2, "find_stack", lambda *a, **k: None)
-        monkeypatch.setattr(CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig()))
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(LaunchState, "load", classmethod(lambda cls, *a: LaunchState()))
+        monkeypatch.setattr(LaunchState, "record", classmethod(lambda cls, **k: None))
         rc = wizard.launch(
             profile="dev", region="us-east-1", size_key="ginormous", assume_yes=True, force_new=True
         )
