@@ -135,6 +135,7 @@ from kiro_crew.dashboard.chat_utils import (
     is_harness_slash_command,
     is_system_injection_item,
     mirror_is_paused,
+    owned_stage_delivery_entry,
     parse_workflow_command,
     remember_slack_options,
     slack_mirror_is_paused,
@@ -197,6 +198,7 @@ from kiro_crew.dashboard.state import (
     parse_hook_continuations,
     should_queue_hook_continuation,
     should_queue_refusal_recovery,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.steer_settle import settle_consumed_steers
 from kiro_crew.dashboard.turn_dispatch import (
@@ -360,6 +362,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     EMPTY_RUNG_GIVE_UP,
     EMPTY_RUNG_REPLAY,
     MODEL_UNENTITLED_KIND,
+    STAGE_DELIVERY_KINDS,
     SUBAGENT_COMPLETION_KIND,
     SYNTHETIC_RECOVERY_KIND,
     TRANSIENT_GIVE_UP_TEXT,
@@ -6925,13 +6928,29 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         )
         or in_stage
     )
+    preferred_stage_delivery = (
+        owned_stage_delivery_entry(stage_boundary_for(slot), slot._queue) if in_stage else None
+    )
+    if in_stage and preferred_stage_delivery is None:
+        # An active stage may consume only delivery owned by its boundary. The
+        # generic system fallback would pull another parent's completion into
+        # this stage; leave it queued until stage execution releases the gate.
+        return False
     if hold_users:
         # During a multi-stage plan hold cron notifications too: each stage is
         # its own _run_chat whose tail-drain runs while _in_stage_execution is
         # still set, so draining a cron here starts an unrelated turn between
         # stages and scatters the plan. It drains at end-of-plan once the gate
         # clears. Sub-agent completions / recovery still flow.
-        next_msg, consumed = _dequeue_next_system_message(slot, exclude_cron=in_stage)
+        next_msg, consumed = _dequeue_next_system_message(
+            slot,
+            exclude_cron=in_stage,
+            preferred_id=(
+                str(preferred_stage_delivery.get("id") or "")
+                if preferred_stage_delivery is not None
+                else ""
+            ),
+        )
     else:
         next_msg, consumed = _dequeue_next_message(slot, merge_enabled=merge)
     if next_msg is None:
@@ -7142,11 +7161,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     # carry one. Recovery rows are included because a completion that failed before
     # the model consumed it is re-queued verbatim under that kind.
     _consumed: list[bool] = [False]
-    _settleable = [
-        item["content"]
-        for item in consumed
-        if item.get("kind") in (SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND)
-    ]
+    _stage_delivery_entry = (
+        owned_stage_delivery_entry(stage_boundary_for(slot), consumed)
+        if slot._in_stage_execution
+        else None
+    )
+    _settleable = [item["content"] for item in consumed if item.get("kind") in STAGE_DELIVERY_KINDS]
 
     if _settleable and not slot.owes_subagent_delivery(_settleable):
         # Owes nothing (every ordinary recovery replay, and any completion whose
@@ -7187,7 +7207,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     _queue_actor = _actor_for_queue_items(consumed)
     if _queue_actor:
         _run_kwargs["_turn_actor"] = _queue_actor
-    if _settleable or _delivery_callbacks:
+    if _stage_delivery_entry is not None or _settleable or _delivery_callbacks:
         _run_kwargs["_on_consumed"] = _note_consumed
     if _irreversible_delivery_callbacks:
         _run_kwargs["_on_irreversibly_consumed"] = _note_irreversibly_consumed
@@ -7223,6 +7243,78 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         _run_chat(state, slot, next_msg, **_run_kwargs),
     )
     slot.task = task
+    if _stage_delivery_entry is not None:
+        _delivery_stop_generation = slot._stop_generation
+
+        def _restore_failed_stage_delivery(done: "asyncio.Task[Any]") -> None:
+            # Four terminal dispositions: cancelled, consumed, already requeued,
+            # or still owed. ``_run_chat`` handles provider failures and returns
+            # normally, so ``done.exception() is None`` is not proof of delivery.
+            # Cooperative Stop is the one cancellation that preserves queued work;
+            # hard kill and teardown keep cancellation-as-discard semantics. The
+            # generation check also catches providers that absorb cancellation and
+            # make the task look normally completed.
+            if _consumed[0]:
+                return
+            _current_stop_generation = slot._stop_generation
+            _stop_changed = _current_stop_generation != _delivery_stop_generation
+            _preserve_stopped_delivery = (
+                _stop_changed
+                and stage_boundary_for(slot).preserve_stop_generation == _current_stop_generation
+            )
+            if _stop_changed and not _preserve_stopped_delivery:
+                return
+            if done.cancelled():
+                if not _preserve_stopped_delivery:
+                    return
+            else:
+                done.exception()
+            if state._slots.get(slot.key) is not slot:
+                return
+            content = str(_stage_delivery_entry.get("content", ""))
+            kind = str(_stage_delivery_entry.get("kind", ""))
+            if any(
+                entry.get("kind") in STAGE_DELIVERY_KINDS and entry.get("content") == content
+                for entry in slot._queue
+            ):
+                return
+            slot.queue_insert(
+                0,
+                content,
+                kind=kind,
+                payload=str(_stage_delivery_entry.get("payload", "")),
+                meta=(
+                    _stage_delivery_entry.get("meta")
+                    if isinstance(_stage_delivery_entry.get("meta"), dict)
+                    else None
+                ),
+                on_consumed=(
+                    _stage_delivery_entry.get("_on_consumed")
+                    if callable(_stage_delivery_entry.get("_on_consumed"))
+                    else None
+                ),
+                on_irreversibly_consumed=(
+                    _stage_delivery_entry.get("_on_irreversibly_consumed")
+                    if callable(_stage_delivery_entry.get("_on_irreversibly_consumed"))
+                    else None
+                ),
+                directive_user_origin=(_stage_delivery_entry.get("_directive_user_origin") is True),
+                directive_channel_origin=(
+                    _stage_delivery_entry.get("_directive_channel_origin") is True
+                ),
+            )
+            state.push_slots_update()
+
+        task.add_done_callback(_restore_failed_stage_delivery)
+    if is_recovery:
+        stage_boundary_for(slot).synthetic_recovery_inflight += 1
+
+        def _release_stage_recovery(_task: "asyncio.Task[Any]") -> None:
+            stage_boundary_for(slot).synthetic_recovery_inflight = max(
+                0, stage_boundary_for(slot).synthetic_recovery_inflight - 1
+            )
+
+        task.add_done_callback(_release_stage_recovery)
     if _settleable:
         # Open the retention clock on the result files this row promises — but
         # only once the turn has actually run and the model has consumed the
@@ -7580,6 +7672,12 @@ async def _run_chat(
             _current_replay_message = None
 
     session_key = effective_session_key(slot)
+    if getattr(slot, "_in_stage_execution", False):
+        # A stage may be linked to another session while this turn runs. Its
+        # children and terminal reports stay under the key captured here, so the
+        # controller settles every captured key instead of re-deriving only the
+        # slot's newest binding after the turn.
+        stage_boundary_for(slot).parent_session_keys.add(session_key)
     sessions = getattr(state, "sessions", None)
 
     def _session_stop_generation() -> int:
@@ -8027,12 +8125,13 @@ async def _run_chat(
                         slot.key,
                         exc_info=True,
                     )
-        if _on_consumed is not None and _consumed_reported != consumed:
+        if _consumed_reported != consumed:
             _consumed_reported = consumed
-            try:
-                _on_consumed(consumed)
-            except Exception:
-                logger.debug("consumption report failed for slot %s", slot.key, exc_info=True)
+            if _on_consumed is not None:
+                try:
+                    _on_consumed(consumed)
+                except Exception:
+                    logger.debug("consumption report failed for slot %s", slot.key, exc_info=True)
 
     def _queue_recovery(
         index: int,
@@ -8055,6 +8154,12 @@ async def _run_chat(
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
 
+        _recovery_meta = {
+            **containment_meta(state, slot),
+            **(extra_meta or {}),
+        }
+        if slot._in_stage_execution:
+            _recovery_meta = stage_boundary_for(slot).tag_meta(_recovery_meta)
         _recovery_qid = slot.queue_insert(
             index,
             content,
@@ -8066,11 +8171,7 @@ async def _run_chat(
             # cron's retry as a user turn. The requeue is the only moment that
             # actor is still known -- the drain sees a fresh queue id and, for a
             # recovery, no kind that names a producer.
-            meta={
-                **containment_meta(state, slot),
-                TURN_ACTOR_META_KEY: _crew_log_actor,
-                **(extra_meta or {}),
-            },
+            meta={**_recovery_meta, TURN_ACTOR_META_KEY: _crew_log_actor},
             on_consumed=_on_consumed if not _consumed_reported else None,
             on_irreversibly_consumed=(
                 _on_irreversibly_consumed if not _irreversible_consumption_reported else None
@@ -8078,6 +8179,8 @@ async def _run_chat(
             directive_user_origin=_directive_user_origin,
             directive_channel_origin=_directive_channel_origin,
         )
+        if slot._in_stage_execution and not _consumed_reported and content == message:
+            stage_boundary_for(slot).retry_queue_id = _recovery_qid
         if _is_refusal_retry_turn and index == 0 and content == message:
             # A verbatim requeue of the refusal retry's own message REPLACES
             # the consumed replay, whichever recovery family issued it: carry
@@ -13709,6 +13812,7 @@ async def _run_chat(
                 if has_plan:
                     _armed_final = True
                     _reset_auto_run_for_new_plan(slot)
+                    stage_boundary_for(slot).clear()
                     assistant_text = ensure_go_all_option(assistant_text)
                     # Store stage count for _stage_loop
                     slot._stage_titles, slot._plan_goal, slot._stage_descriptions = (
@@ -14109,6 +14213,7 @@ async def _run_chat(
                     slot.key,
                 )
                 _reset_auto_run_for_new_plan(slot)
+                stage_boundary_for(slot).clear()
                 slot._stage_titles, slot._plan_goal, slot._stage_descriptions = (
                     _extract_and_redact_plan_metadata(_orch_plan_buf)
                 )
@@ -14964,6 +15069,44 @@ async def _run_chat(
         # Every queued prompt would hit the same wall. Popping them one by one
         # would drain the whole queue into identical failures, leaving nothing to
         # resume after the user signs in — so hold the queue intact instead.
+        # The current system input was already popped before this turn began;
+        # restore it through the ordinary recovery helper so its delivery
+        # callbacks, provenance, and containment stamp survive post-login retry.
+        # One auth failure owns one identity. Clear any older retry before this
+        # turn decides whether it produced an exact replacement row.
+        if slot._in_stage_execution:
+            stage_boundary_for(slot).retry_queue_id = ""
+        _auth_retry_kind = ""
+        if _synthetic_recovery_turn or (
+            _synthetic_payload and message == SUBAGENT_SYNTHESIS_PROMPT
+        ):
+            # A synthesis turn is runner-authored even though its ledger actor is
+            # ``subagent``. Preserve inject provenance across login; classifying
+            # from the broad actor would drain the internal prompt as user text.
+            _auth_retry_kind = SYNTHETIC_RECOVERY_KIND
+        elif _turn_actor == "subagent":
+            _auth_retry_kind = SUBAGENT_COMPLETION_KIND
+        if (
+            _auth_retry_kind
+            and not _consumed_reported
+            and not any(
+                entry.get("kind") == _auth_retry_kind and entry.get("content") == message
+                for entry in slot._queue
+            )
+        ):
+            _current_meta = (
+                _current_message.get("meta")
+                if _current_message is not None and isinstance(_current_message.get("meta"), dict)
+                else None
+            )
+            retry_queue_id = _queue_recovery(
+                0,
+                message,
+                kind=_auth_retry_kind,
+                extra_meta=_current_meta,
+            )
+            if slot._in_stage_execution:
+                stage_boundary_for(slot).retry_queue_id = retry_queue_id
         _auth_required = True
         needs_session_reset = True
         _persist_partial_reply()

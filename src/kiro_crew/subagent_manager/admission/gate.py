@@ -77,6 +77,7 @@ class _GateMixin(ManagerComponent):
         _memory_mode: str | None = None,
         *,
         crew: str = "",
+        _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | None":
         """Spawn a subagent for *task*.
 
@@ -380,6 +381,7 @@ class _GateMixin(ManagerComponent):
             # of the crew it was handed to.
             "memory_store": memory_store,
             "crew": crew,
+            "_stage_boundary_owner": _stage_boundary_owner,
             "_memory_mode": _memory_mode,
             # Same rule for the asking turn: `spawn_async` re-enters from this
             # dict (prepare -> write -> re-enter), so a follow-up whose asking

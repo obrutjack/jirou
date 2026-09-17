@@ -68,6 +68,7 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
     DashboardState,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -94,7 +95,11 @@ from kiro_crew.solo_spawn import (
     solo_spawn_question,
 )
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
-from kiro_crew.subagent import effort_applied_note, effort_drop_reason
+from kiro_crew.subagent import (
+    effort_applied_note,
+    effort_drop_reason,
+    stage_boundary_owner_for_run,
+)
 from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
@@ -224,6 +229,26 @@ async def _spawn_request_memory_mode(
         parent_mode if caller == parent else await resolve_session_memory_mode(state, caller)
     )
     return strictest((parent_mode, caller_mode)) or "persistent"
+
+
+def _stage_boundary_owner_for_parent(state: DashboardState, parent: str) -> str:
+    """Return the active stage token for *parent*, or explicit unowned ``""``."""
+    slot_name = dashboard_slot_key(parent)
+    if not slot_name and parent.startswith("dashboard:"):
+        slot_name = parent.removeprefix("dashboard:")
+    slots = getattr(state, "_slots", None)
+    slot = slots.get(slot_name) if isinstance(slots, dict) and slot_name else None
+    if slot is None and isinstance(slots, dict):
+        slot = next(
+            (
+                candidate
+                for candidate in slots.values()
+                if effective_session_key(candidate) == parent
+            ),
+            None,
+        )
+    owner = stage_boundary_for(slot).owner
+    return owner if isinstance(owner, str) else ""
 
 
 async def api_spawn(request: web.Request) -> web.Response:
@@ -479,6 +504,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         memory_store=child_memory_store,
         crew=crew,
         _memory_mode=admitted_mode,
+        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -671,6 +697,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         max_turns=max_turns,
         cwd=resumed_cwd,
         _memory_mode=admitted_mode,
+        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
     )
     if not info:
         return web.json_response(
@@ -1141,6 +1168,10 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         # it" -- and a retry is exactly when nobody re-reads the scope.
         memory_store=old.memory_store,
         crew=old.crew,
+        _stage_boundary_owner=(
+            _stage_boundary_owner_for_parent(state, old.parent_session_key)
+            or stage_boundary_owner_for_run(old)
+        ),
     )
     if not info:
         return web.json_response(
@@ -1213,7 +1244,30 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     cancelled = await state.subagents.cancel(agent_id)
     if not cancelled:
-        # Already done — just remove from list
+        info = state.subagents._agents.get(agent_id)
+        if info is not None and getattr(info, "_report_failure_latched", False):
+            owner = stage_boundary_owner_for_run(info)
+            parent = info.parent_session_key
+            active_owner = _stage_boundary_owner_for_parent(state, parent)
+            if owner and active_owner == owner:
+                delivered = await state.subagents._run_terminal_report(
+                    info,
+                    source="Completed run deletion",
+                    injection_timeout_reason="delivery timed out while deleting completed run",
+                    mark_delivered_on_success=False,
+                )
+                if not delivered:
+                    state.subagents._localize_report_failure(info)
+                    return web.json_response(
+                        {
+                            "error": "completion delivery is still pending",
+                            "code": "completion_delivery_pending",
+                        },
+                        status=409,
+                    )
+                state.subagents._clear_report_failure(info)
+            elif owner:
+                state.subagents.discard_report_failures(parent, owner)
         state.subagents._agents.pop(agent_id, None)
         state.subagents._tasks.pop(agent_id, None)
     return web.json_response({"ok": True, "cancelled": cancelled})

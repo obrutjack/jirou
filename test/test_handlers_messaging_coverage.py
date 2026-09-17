@@ -800,6 +800,36 @@ class TestApiSpawnRetry:
         assert kwargs["include_project"] is False
         assert kwargs["crew"] == "coding"
 
+    def test_retry_after_parent_advances_is_owned_by_active_stage_boundary(self) -> None:
+        """A stage-1 failure retried during stage 2 joins stage 2's barrier."""
+        from kiro_crew.dashboard.state import StageBoundary
+
+        parent = "dashboard:chat-1"
+        boundary = StageBoundary(stage=2, generation="stage-2-owner")
+        mgr = _mgr()
+        mgr.get.return_value = _info(
+            done=True,
+            outcome="failed",
+            parent_session_key=parent,
+            _stage_boundary_owner="stage-1-owner",
+        )
+        mgr.spawn.return_value = _info(id="new")
+        state = _state(subagents=mgr)
+        state._slots = {
+            "chat-1": SimpleNamespace(stage_boundary=boundary),
+        }
+
+        response = _run(
+            mod.api_spawn_retry,
+            _Req(state, None, match_info={"agent_id": "a1"}),
+        )
+
+        assert response.status == 200
+        retry_owner = mgr.spawn.call_args.kwargs["_stage_boundary_owner"]
+        assert retry_owner == "stage-2-owner"
+        completion = {"meta": boundary.tag_captured_meta({}, retry_owner)}
+        assert boundary.owns_entry(completion)
+
 
 class TestApiSpawnDelete:
     def test_404_for_unknown_native_card(self) -> None:
@@ -838,11 +868,56 @@ class TestApiSpawnDelete:
         assert _payload(_run(mod.api_spawn_delete, req)) == {"ok": True, "cancelled": True}
 
     def test_removes_an_already_finished_agent(self) -> None:
-        mgr = _mgr(_agents={"a1": _info()}, cancel=AsyncMock(return_value=False))
+        info = _info()
+        mgr = _mgr(_agents={"a1": info}, cancel=AsyncMock(return_value=False))
         mgr._tasks = {"a1": object()}
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
         assert _payload(_run(mod.api_spawn_delete, req))["cancelled"] is False
+        mgr._clear_report_failure.assert_not_called()
         assert mgr._agents == {} and mgr._tasks == {}
+
+    def test_preserves_finished_agent_when_boundary_redelivery_fails(self) -> None:
+        from kiro_crew.dashboard.state import StageBoundary
+
+        info = _info(
+            parent_session_key="dashboard:chat-1",
+            _stage_boundary_owner="owner",
+            _report_failure_latched=True,
+        )
+        mgr = _mgr(
+            _agents={"a1": info},
+            cancel=AsyncMock(return_value=False),
+            _run_terminal_report=AsyncMock(return_value=False),
+        )
+        state = _state(subagents=mgr)
+        state._slots = {
+            "chat-1": SimpleNamespace(stage_boundary=StageBoundary(stage=1, generation="owner"))
+        }
+        req = _Req(state, None, match_info={"agent_id": "a1"})
+
+        response = _run(mod.api_spawn_delete, req)
+
+        assert response.status == 409
+        assert _payload(response)["code"] == "completion_delivery_pending"
+        assert mgr._agents == {"a1": info}
+        mgr._localize_report_failure.assert_called_once_with(info)
+
+    def test_discards_finished_agent_debt_with_a_gone_boundary(self) -> None:
+        info = _info(
+            parent_session_key="dashboard:chat-1",
+            _stage_boundary_owner="owner",
+            _report_failure_latched=True,
+        )
+        mgr = _mgr(_agents={"a1": info}, cancel=AsyncMock(return_value=False))
+        state = _state(subagents=mgr)
+        state._slots = {}
+        req = _Req(state, None, match_info={"agent_id": "a1"})
+
+        response = _run(mod.api_spawn_delete, req)
+
+        assert response.status == 200
+        assert mgr._agents == {}
+        mgr.discard_report_failures.assert_called_once_with("dashboard:chat-1", "owner")
 
 
 class TestApiSpawnStopAll:

@@ -157,6 +157,7 @@ from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     DashboardState,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.dashboard.turn_dispatch import bounded_chat_turn, spawn_guarded_turn
@@ -346,6 +347,7 @@ from kiro_crew.subagent import (
     ToolApprovalCallback,
     _injection_notice_outcome,
     resolve_max_subagents,
+    stage_boundary_owner_for_run,
 )
 from kiro_crew.subagent_completion_meta import (
     OUTCOME_FAILED,
@@ -8521,7 +8523,7 @@ class GatewayOrchestrator:
             if not self.dashboard_state:
                 return
             _max_retrigger = 3
-            if slot._recovery_retrigger_count >= _max_retrigger:
+            if stage_boundary_for(slot).recovery_retrigger_count >= _max_retrigger:
                 logger.warning(
                     "Recovery retrigger cap (%d) reached for %s, dropping %d queued failures",
                     _max_retrigger,
@@ -8530,7 +8532,7 @@ class GatewayOrchestrator:
                 )
                 slot._pending_subagent_failures.clear()
                 return
-            slot._recovery_retrigger_count += 1
+            stage_boundary_for(slot).recovery_retrigger_count += 1
             slot._recovery_chat_triggered = True
             # Bound here rather than at module scope: this reads ``_run_chat`` from
             # ``dashboard.chat``, a different module than the top-level
@@ -9268,6 +9270,33 @@ class GatewayOrchestrator:
                     # is delivered. try/finally so a CancelledError can't leak it.
                     _injection_slot._subagent_deliveries_inflight += 1
                     try:
+                        if getattr(_injection_slot, "_in_stage_execution", False) is True:
+                            # The Python stage controller owns this boundary. It
+                            # waits for terminal reports, then drains completion
+                            # entries in order before capturing or advancing.
+                            # Launching here would race that capture; waiting on
+                            # slot.task can wait on the controller itself.
+                            _injection_slot.queue_append(
+                                announce,
+                                kind=SUBAGENT_COMPLETION_KIND,
+                                meta=stage_boundary_for(_injection_slot).tag_captured_meta(
+                                    {SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                                    stage_boundary_owner_for_run(info),
+                                ),
+                            )
+                            self._defer_queued_delivery(
+                                _injection_slot,
+                                announce,
+                                info,
+                                flush_only=_flush_only,
+                            )
+                            self.dashboard_state.push_slots_update()
+                            logger.info(
+                                "Subagent %s → queued for Autopilot stage in %s",
+                                info.id,
+                                _slot_name,
+                            )
+                            return
                         if _injection_slot_busy(_injection_slot):
                             # Slot is busy (or an injection is dispatched but
                             # not yet started) — wait for that task to finish,
@@ -9316,7 +9345,10 @@ class GatewayOrchestrator:
                                 _injection_slot.queue_append(
                                     announce,
                                     kind=SUBAGENT_COMPLETION_KIND,
-                                    meta={SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                                    meta=stage_boundary_for(_injection_slot).tag_captured_meta(
+                                        {SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                                        stage_boundary_owner_for_run(info),
+                                    ),
                                 )
                                 # Queuing is not delivery. The announce promises
                                 # result paths the parent can read on demand, but

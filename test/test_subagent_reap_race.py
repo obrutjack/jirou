@@ -392,6 +392,200 @@ async def test_run_path_claim_still_withheld_during_recovering():
     assert info._recovering is True, "the non-terminal path must not clear it"
 
 
+# ── terminal report outcomes must reach parent settlement ────────────
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_failure_reaches_parent_barrier():
+    """A handled announce failure is still a failed boundary-owned delivery."""
+    from kiro_crew.subagent import SubagentReportDeliveryError
+
+    mgr = _make_manager()
+    owner = "stage-owner"
+    info = _info(parent_session_key="dashboard:parent", _stage_boundary_owner=owner)
+    mgr._on_done = AsyncMock(side_effect=RuntimeError("parent delivery failed"))
+    await mgr._spawn_terminal_report(
+        info,
+        source="test",
+        injection_timeout_reason="delivery failed",
+        mark_delivered_on_success=False,
+    )
+    with pytest.raises(SubagentReportDeliveryError):
+        await mgr.wait_for_parent_reports(info.parent_session_key, owner)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_unowned_report_failure_neither_halts_nor_advances_stage():
+    """An ordinary report cannot poison or bypass a later stage barrier."""
+    mgr = _make_manager()
+    parent, owner = "dashboard:parent", "later-stage-owner"
+    mgr._latch_report_failure(_info(parent_session_key=parent))
+    assert mgr._report_failures == {}
+
+    release = asyncio.Event()
+    report = asyncio.create_task(release.wait())
+    mgr._report_owners[report] = _info(
+        parent_session_key=parent, _stage_boundary_owner=owner
+    )
+    waiter = asyncio.create_task(mgr.wait_for_parent_reports(parent, owner))
+    await asyncio.sleep(0)
+    assert not waiter.done(), "unrelated failure halted or advanced the owned barrier"
+    release.set()
+    assert await waiter is True
+
+
+@pytest.mark.asyncio
+async def test_report_failure_parent_cap_overflow_fails_closed_globally(monkeypatch):
+    """Scope overflow is global; one scope's count saturation is not."""
+    import kiro_crew.subagent as mod
+    from kiro_crew.subagent import SubagentReportDeliveryError
+
+    monkeypatch.setattr(mod, "_REPORT_FAILURE_PARENT_CAP", 2)
+    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 2)
+    manager = _make_manager()
+    for index in range(3):
+        manager._latch_report_failure(
+            _info(
+                parent_session_key=f"parent-{index}",
+                _stage_boundary_owner=f"stage-{index}",
+            )
+        )
+
+    with pytest.raises(SubagentReportDeliveryError):
+        await manager.wait_for_parent_reports("parent-2", "stage-2")
+    with pytest.raises(SubagentReportDeliveryError):
+        await manager.wait_for_parent_reports("unrelated", "stage-x")
+    assert len(manager._report_failures) <= 2
+
+    count_manager = _make_manager()
+    for _ in range(5):
+        count_manager._latch_report_failure(
+            _info(parent_session_key="runaway", _stage_boundary_owner="stage")
+        )
+    assert count_manager._peek_report_failures("runaway", "stage") == 3
+    with pytest.raises(SubagentReportDeliveryError):
+        await count_manager.wait_for_parent_reports("runaway", "stage")
+    assert await count_manager.wait_for_parent_reports("unrelated", "stage-x") is False
+    assert len(count_manager._report_failures) == 1
+
+
+@pytest.mark.asyncio
+async def test_parent_pending_work_includes_live_followup_watcher():
+    """A parent-owned follow-up watcher holds stage settlement open."""
+    manager = _make_manager()
+    parent = "dashboard:parent"
+    info = _info(id="followup", done=True, parent_session_key=parent)
+    release = asyncio.Event()
+    watcher = asyncio.create_task(release.wait())
+    manager._agents = {info.id: info}
+    manager._followup_watchers = {info.id: watcher}
+    manager._followup_watcher_parents = {info.id: parent}
+    manager._queued_depth = MagicMock(return_value=0)
+    manager._queued_depth_async = AsyncMock(return_value=0)
+
+    try:
+        assert manager.has_pending_work_for(parent) is True
+        assert await manager.has_pending_work_for_async(parent) is True
+        assert manager.has_pending_work_for("dashboard:other") is False
+    finally:
+        release.set()
+        await watcher
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["exact", "global-overflow"])
+@pytest.mark.parametrize("resolution", ["redelivered", "discarded"])
+@pytest.mark.asyncio
+async def test_debt_bearing_record_cap_moves_payloads_to_boundary(overflow, resolution):
+    """The record cap holds while every failed payload remains boundary-owned."""
+    import inspect
+
+    from kiro_crew.context_management import MAX_RETAINED_AGENTS
+    from kiro_crew.subagent import (
+        _REPORT_FAILURE_OVERFLOW_KEY,
+        SubagentReportDeliveryError,
+    )
+    from kiro_crew.subagent_manager.run import RunEventCoordinator
+
+    manager = _make_manager()
+    parent, owner = "dashboard:parent", "stage-owner"
+    infos = [
+        _info(
+            id=f"completed-{index}",
+            done=True,
+            started=float(index),
+            parent_session_key=parent,
+            _stage_boundary_owner=owner,
+        )
+        for index in range(MAX_RETAINED_AGENTS + 1)
+    ]
+    manager._agents = {info.id: info for info in infos}
+    for info in infos:
+        manager._latch_report_failure(info)
+    if overflow:
+        count = manager._report_failures.pop((parent, owner))
+        manager._report_failures[_REPORT_FAILURE_OVERFLOW_KEY] = count
+
+    deliver = False
+    attempts: list[str] = []
+    delivered: list[str] = []
+
+    async def _report(info, **_kwargs):
+        attempts.append(info.id)
+        if deliver:
+            delivered.append(info.id)
+            return True
+        return False
+
+    manager._run_terminal_report = _report
+    coordinator = RunEventCoordinator(manager)
+
+    assert await coordinator._evict_completed_records() == 1
+    assert len(manager._agents) == MAX_RETAINED_AGENTS
+    assert infos[0].id not in manager._agents
+    with pytest.raises(SubagentReportDeliveryError):
+        await manager.wait_for_parent_reports(parent, owner)
+
+    if resolution == "redelivered":
+        deliver = True
+        assert await manager.wait_for_parent_reports(parent, owner) is True
+        assert set(delivered) == {info.id for info in infos}
+        assert len(delivered) == len(infos)
+    else:
+        manager.discard_report_failures(parent, owner)
+        assert await manager.wait_for_parent_reports(parent, owner) is False
+
+    assert all(info._report_failure_latched is False for info in infos)
+    assert manager._report_failures == {}
+    assert attempts
+    source = inspect.getsource(RunEventCoordinator._run_inner_impl)
+    assert "await self._evict_completed_records()" in source
+
+
+def test_report_failure_latch_bounds_parent_cap_and_count_overflow(monkeypatch):
+    """Every retained failure field stays bounded without becoming success."""
+    import kiro_crew.subagent as mod
+
+    monkeypatch.setattr(mod, "_REPORT_FAILURE_PARENT_CAP", 2)
+    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 2)
+    mgr = _make_manager()
+    for _ in range(5):
+        mgr._latch_report_failure(
+            _info(parent_session_key="first", _stage_boundary_owner="first")
+        )
+    for key in ("second", "overflow"):
+        mgr._latch_report_failure(
+            _info(parent_session_key=key, _stage_boundary_owner=key)
+        )
+
+    assert len(mgr._report_failures) == 2
+    assert all(count <= 3 for count in mgr._report_failures.values())
+    settled = _info(parent_session_key="overflow", _stage_boundary_owner="overflow")
+    mgr._latch_report_failure(settled)
+    assert mgr._peek_report_failures("overflow", "overflow") == 3
+    mgr._clear_report_failure(settled)
+    assert mgr._peek_report_failures("overflow", "overflow") == 2
+
+
 # ── the shutdown drain must not abandon stragglers ───────────────────
 
 

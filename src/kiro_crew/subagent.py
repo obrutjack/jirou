@@ -514,6 +514,10 @@ _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
 )
+# Bound boundary-scoped report failures after their terminal tasks disappear.
+_REPORT_FAILURE_PARENT_CAP = 500
+_REPORT_FAILURES_PER_PARENT_CAP = 64
+_REPORT_FAILURE_OVERFLOW_KEY = ("", "")
 # Max seconds a cancelled run holds cancellation open for an in-flight off-loop
 # state.json write worker -- every off-loop writer: long enough for any healthy
 # fsync, short enough that a wedged FS
@@ -1217,6 +1221,12 @@ _SYSTEM_PREFIX = (
 )
 
 
+def stage_boundary_owner_for_run(info: object) -> str:
+    """Return a run's captured owner token; a missing token is unowned."""
+    owner = getattr(info, "_stage_boundary_owner", "")
+    return owner if isinstance(owner, str) else ""
+
+
 @dataclass
 class SubagentInfo:
     """Metadata for a running subagent."""
@@ -1247,6 +1257,8 @@ class SubagentInfo:
     # record, and the handler answers 429 from that absence.
     error_code: str = ""
     parent_session_key: str = ""
+    # Boundary owner captured at admission; empty means explicitly unowned.
+    _stage_boundary_owner: str = field(default="", repr=False)
     memory_mode: str = field(default="persistent", kw_only=True)
     _memory_mode_ready: bool = field(default=True, init=False, repr=False)
     agent: str = ""
@@ -1540,6 +1552,8 @@ class SubagentInfo:
     # a report cancelled BEFORE delivery — which must be made recoverable on the
     # next start — from one cancelled AFTER it, which must not be re-delivered.
     _reported_to_parent: bool = False
+    # One bounded-latch debt for this completion; cleared only after redelivery.
+    _report_failure_latched: bool = field(default=False, init=False, repr=False)
     # The run's final ACP ``stop_reason`` and its ``classify_stop_reason``
     # class (a ``STOP_CLASS_*`` value), recorded by ``_run_inner`` on the
     # completion that ended the run
@@ -1632,6 +1646,10 @@ def _context_groups_of(info: "SubagentInfo") -> frozenset[str]:
 def _context_groups_field(info: "SubagentInfo") -> str:
     """``state.json`` encoding of the run's scope: comma-joined, sorted."""
     return ",".join(sorted(_context_groups_of(info)))
+
+
+class SubagentReportDeliveryError(RuntimeError):
+    """One or more registered terminal reports failed before delivery."""
 
 
 class ToolApprovalCallback(Protocol):
@@ -1770,8 +1788,18 @@ class SubagentManager:
         # cancel_all() — a watcher parked in the global _safe_fire set would
         # survive shutdown and dispatch against a closing SessionManager.
         self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+        # Run id -> parent session for each live watcher. Kept separately from
+        # `_agents` because completed-record eviction can remove the run while
+        # its watcher still owns a follow-up dispatch.
+        self._followup_watcher_parents: dict[str, str] = {}
         # task -> the agent whose terminal report it is delivering
         self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
+        # Boundary-scoped failures outlive completed report tasks. The overflow
+        # key fails the next owned boundary closed when the cap loses identity.
+        self._report_failures: dict[tuple[str, str], int] = {}
+        # Exact boundary -> failed terminal payloads detached from record
+        # retention. Entries leave on successful redelivery or boundary discard.
+        self._boundary_report_payloads: dict[tuple[str, str], dict[str, SubagentInfo]] = {}
         self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
@@ -2357,7 +2385,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> None:
+    ) -> bool:
         return await self._terminal._report_terminal_impl(
             info,
             source=source,
@@ -2376,7 +2404,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> None:
+    ) -> bool:
         return await self._terminal._run_terminal_report_impl(
             info,
             source=source,
@@ -2395,7 +2423,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> "asyncio.Task":  # type: ignore[type-arg]
+    ) -> "asyncio.Task[bool]":
         return self._terminal._spawn_terminal_report_impl(
             info,
             source=source,
@@ -2406,7 +2434,7 @@ class SubagentManager:
         )
 
     @staticmethod
-    async def _await_report(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
+    async def _await_report(task: "asyncio.Task[bool]") -> bool:
         """Block until a spawned terminal report completes, shielded.
 
         On normal completion this blocks until the report is delivered
@@ -2415,7 +2443,178 @@ class SubagentManager:
         still receives ``CancelledError`` — teardown semantics are unchanged and
         the outcome is never stranded.
         """
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
+
+    def _latch_report_failure(self, info: object) -> None:
+        """Retain one boundary-owned failure in a fully bounded latch."""
+        if getattr(info, "_report_failure_latched", False):
+            return
+        owner = stage_boundary_owner_for_run(info)
+        parent = getattr(info, "parent_session_key", "")
+        if not owner or not isinstance(parent, str) or not parent:
+            return
+
+        failures = self._report_failures
+        limit = _REPORT_FAILURES_PER_PARENT_CAP + 1
+        key = (parent, owner)
+        if key not in failures and len(failures) >= _REPORT_FAILURE_PARENT_CAP:
+            key = _REPORT_FAILURE_OVERFLOW_KEY
+            if key not in failures:
+                evicted = failures.pop(next(iter(failures)))
+                failures[key] = min(evicted, limit)
+        failures[key] = min(failures.get(key, 0) + 1, limit)
+        setattr(info, "_report_failure_latched", True)
+
+    def _retain_report_failure_payload(self, info: SubagentInfo) -> None:
+        """Detach one failed terminal payload from completed-record retention."""
+        if not info._report_failure_latched:
+            return
+        owner = stage_boundary_owner_for_run(info)
+        parent = info.parent_session_key
+        if not owner or not parent:
+            return
+        self._boundary_report_payloads.setdefault((parent, owner), {})[info.id] = info
+
+    def _clear_report_failure(self, info: object) -> None:
+        """Settle one latched failure after that report is redelivered."""
+        if not getattr(info, "_report_failure_latched", False):
+            return
+        owner = stage_boundary_owner_for_run(info)
+        parent = getattr(info, "parent_session_key", "")
+        if owner and isinstance(parent, str) and parent:
+            failures = self._report_failures
+            for key in ((parent, owner), _REPORT_FAILURE_OVERFLOW_KEY):
+                count = failures.get(key, 0)
+                if not count:
+                    continue
+                if count == 1:
+                    failures.pop(key, None)
+                else:
+                    failures[key] = count - 1
+                break
+            payload_id = getattr(info, "id", "")
+            payloads = self._boundary_report_payloads.get((parent, owner))
+            if payloads is not None and isinstance(payload_id, str):
+                payloads.pop(payload_id, None)
+                if not payloads:
+                    self._boundary_report_payloads.pop((parent, owner), None)
+        setattr(info, "_report_failure_latched", False)
+
+    def _localize_report_failure(self, info: object) -> None:
+        """Move one retained payload's global debt back to its exact boundary."""
+        if not getattr(info, "_report_failure_latched", False):
+            return
+        owner = stage_boundary_owner_for_run(info)
+        parent = getattr(info, "parent_session_key", "")
+        if not owner or not isinstance(parent, str) or not parent:
+            return
+        failures = self._report_failures
+        exact_key = (parent, owner)
+        if failures.get(exact_key, 0):
+            return
+        overflow = failures.get(_REPORT_FAILURE_OVERFLOW_KEY, 0)
+        if not overflow:
+            return
+        if overflow == 1:
+            failures.pop(_REPORT_FAILURE_OVERFLOW_KEY, None)
+        else:
+            failures[_REPORT_FAILURE_OVERFLOW_KEY] = overflow - 1
+        limit = _REPORT_FAILURES_PER_PARENT_CAP + 1
+        failures[exact_key] = min(failures.get(exact_key, 0) + 1, limit)
+
+    def discard_report_failures(self, parent: str, owner: str) -> None:
+        """Drop report debt and retained payloads when a boundary is discarded."""
+        if not parent or not owner:
+            return
+        retained = tuple(self._boundary_report_payloads.pop((parent, owner), {}).values())
+        candidates = (*retained, *tuple(self._agents.values()))
+        for info in candidates:
+            if (
+                getattr(info, "parent_session_key", "") == parent
+                and stage_boundary_owner_for_run(info) == owner
+                and getattr(info, "_report_failure_latched", False)
+            ):
+                self._clear_report_failure(info)
+        self._report_failures.pop((parent, owner), None)
+
+    async def _redeliver_boundary_report_payloads(self, parent: str, owner: str) -> bool:
+        """Retry terminal payloads detached into one live stage boundary."""
+        retained = tuple(self._boundary_report_payloads.get((parent, owner), {}).values())
+        for info in retained:
+            delivered = await self._run_terminal_report(
+                info,
+                source="Stage boundary report retry",
+                injection_timeout_reason="delivery timed out while retrying stage boundary",
+                mark_delivered_on_success=False,
+            )
+            if delivered:
+                self._clear_report_failure(info)
+            else:
+                self._localize_report_failure(info)
+        return bool(retained)
+
+    def _peek_report_failures(self, parent: str, owner: str) -> int:
+        """Read this boundary's failures without consuming its delivery debt."""
+        if not owner:
+            return 0
+        failures = self._report_failures
+        exact = failures.get((parent, owner), 0)
+        overflow = failures.get(_REPORT_FAILURE_OVERFLOW_KEY, 0)
+        return min(exact + overflow, _REPORT_FAILURES_PER_PARENT_CAP + 1)
+
+    async def wait_for_parent_reports(
+        self,
+        parent_session_key: str,
+        boundary_owner: str = "",
+    ) -> bool:
+        """Wait until this boundary's registered terminal reports finish.
+
+        Active tasks live in ``_report_owners``; completed failures remain in
+        ``_report_failures`` until their report is successfully redelivered.
+        """
+        observed = False
+        while True:
+            if await self._redeliver_boundary_report_payloads(
+                parent_session_key,
+                boundary_owner,
+            ):
+                observed = True
+            failed = self._peek_report_failures(parent_session_key, boundary_owner)
+            if failed:
+                raise SubagentReportDeliveryError(
+                    f"{failed} registered terminal report task(s) failed"
+                )
+            reports = tuple(
+                task
+                for task, owner in self._report_owners.items()
+                if owner.parent_session_key == parent_session_key
+                and stage_boundary_owner_for_run(owner) == boundary_owner
+            )
+            if not reports:
+                return observed
+            observed = True
+            outcomes = await asyncio.gather(
+                *(asyncio.shield(task) for task in reports),
+                return_exceptions=True,
+            )
+            # The normal done callback removes every owner and latches failures.
+            # Focused tests and shutdown races may leave a completed entry here;
+            # consume it explicitly so the barrier cannot observe it twice.
+            for task in reports:
+                if task.done():
+                    self._report_owners.pop(task, None)
+            outcome_failures = sum(
+                isinstance(outcome, BaseException) or outcome is False for outcome in outcomes
+            )
+            latched_failures = self._peek_report_failures(
+                parent_session_key,
+                boundary_owner,
+            )
+            failed = max(outcome_failures, latched_failures)
+            if failed:
+                raise SubagentReportDeliveryError(
+                    f"{failed} registered terminal report task(s) failed"
+                )
 
     def _release_slot(self, info: SubagentInfo) -> bool:
         return self._terminal._release_slot_impl(info)
@@ -2586,6 +2785,7 @@ class SubagentManager:
         _child_registration: bool = True,
         *,
         crew: str = "",
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         result = self._admission.spawn_impl(
             task,
@@ -2619,8 +2819,13 @@ class SubagentManager:
             _window_hint=_window_hint,
             _child_registration=_child_registration,
             crew=crew,
+            _stage_boundary_owner=_stage_boundary_owner,
         )
         assert not isinstance(result, PreparedSpawn)
+        # Every synchronous gate return (started, queued, or refused) receives
+        # the same admission snapshot before a scheduled announce can run.
+        if isinstance(result, SubagentInfo):
+            result._stage_boundary_owner = _stage_boundary_owner
         # ``ClaimPoint`` comes back ONLY for ``_stop_before_claim=True``, whose
         # sole caller is the coroutine pump's ``_dispatch_async``; every other
         # caller receives a ``SubagentInfo`` or None as declared.
@@ -2635,6 +2840,8 @@ class SubagentManager:
         kwargs.pop("_store_accepted", None)
         prepared = self._admission.spawn_impl(task, _prepare_only=True, **kwargs)
         assert not isinstance(prepared, ClaimPoint)  # never requested here
+        if isinstance(prepared, SubagentInfo):
+            prepared._stage_boundary_owner = str(kwargs.get("_stage_boundary_owner") or "")
         return prepared
 
     async def spawn_async(self, task: str, **kwargs: Any) -> SubagentInfo | None:
@@ -2687,6 +2894,7 @@ class SubagentManager:
                     task=redact_credentials(redact_exfiltration_urls(task)[0])[0],
                     agent=str(kwargs.get("agent") or ""),
                     parent_session_key=str(kwargs.get("parent_session_key") or ""),
+                    _stage_boundary_owner=str(kwargs.get("_stage_boundary_owner") or ""),
                     done=True,
                     error=f"spawn refused: task store unavailable ({store_err})",
                     error_code=self._admission.TASK_STORE_UNAVAILABLE_CODE,
@@ -2767,6 +2975,7 @@ class SubagentManager:
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
         _crew_log_asked: "tuple[str, int] | None" = None,
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         return self._continuation.continue_conversation_impl(
             conv_id,
@@ -2779,6 +2988,7 @@ class SubagentManager:
             _preassigned_id,
             _memory_mode=_memory_mode,
             _crew_log_asked=_crew_log_asked,
+            _stage_boundary_owner=_stage_boundary_owner,
         )
 
     async def continue_conversation_async(
@@ -2793,6 +3003,7 @@ class SubagentManager:
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
         _crew_log_asked: "tuple[str, int] | None" = None,
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         return await self._continuation.continue_conversation_async_impl(
             conv_id,
@@ -2805,6 +3016,7 @@ class SubagentManager:
             _preassigned_id,
             _memory_mode,
             _crew_log_asked,
+            _stage_boundary_owner,
         )
 
     def _continue_prelude(
@@ -2819,6 +3031,7 @@ class SubagentManager:
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
         _crew_log_asked: "tuple[str, int] | None" = None,
+        _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | dict[str, Any] | None":
         return self._continuation._continue_prelude_impl(
             conv_id,
@@ -2831,6 +3044,7 @@ class SubagentManager:
             _preassigned_id,
             _memory_mode,
             _crew_log_asked,
+            _stage_boundary_owner,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:
