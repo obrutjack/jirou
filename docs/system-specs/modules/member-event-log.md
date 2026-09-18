@@ -10,17 +10,26 @@ The log is the record; every view is a fold of it. A change appends one event, t
 
 ## 2. Storage and the envelope
 
-Each member owns `<data_home>/members/<slug>/log.jsonl`. Line 1 is a header, not an event:
+Each member's log is a `member`-kind **crew log**, so it lives at `<data_home>/crew-log/members/<store name>/log.jsonl`, where `<store name>` is the readable-plus-digest fold of the slug that every crew log uses. `kiro_crew.eventlog.log` is an adapter over `kiro_crew.crew_log.store`; the bytes, the locking, the durability, the torn-tail repair and retention all belong to that store, which already owns them for the `crew` and `session` kinds.
+
+A third kind rather than a second mechanism, because the protection is named at the root: `crew-log` is masked from a sandboxed process (`sandbox._CREW_HIDDEN_LEAVES`) and refused to the agent's own file tools (`security.paths._CREW_SECRET_LEAVES`), so a kind placed under it inherits both. Dispatch trust reads this log, and an append-only record an agent can rewrite is not an append-only record — that property has to hold by where the file lives, not by someone remembering to add a second fence entry when a new log appears.
+
+Line 1 is a header, not an event:
 
 ```
 {"type":"member","version":1,"id":"<slug>","name":"<name>","createdAt":<epoch ms>}
 ```
 
-Every later line is an envelope `{"type", "seq", "time", "data"}`. `seq` is the zero-based position of the event after the header: `MemberLog.append()` assigns `len(events)` and refuses anything else, and `MemberLog.load()` treats a gap or a parse error inside the committed region as corruption (`LogCorrupt`). A torn trailing line — no newline, or unparsable — is repaired by truncating the file to the committed byte length and fsyncing; load then returns normally and the next append continues the sequence.
+Every later line is a crew log entry, which this module presents as the envelope `{"type", "seq", "time", "data"}`. Two translations live in the adapter and nowhere else, so nothing above it changes:
 
-Writes are serialized per member. Each append opens the file in append mode, records the size, writes one line and fsyncs; on any failure it truncates back to the recorded size so a retry cannot produce a duplicate `seq`. The first write materialises the file through a temp file, a hard link and a directory fsync. The log is never rewritten or truncated for retention.
+- **`seq`.** A crew log numbers the header 0 and the first entry 1. This module's `seq` is the zero-based position of the event *after* the header — the numbering its WebSocket frames and catch-up reads already speak — so the adapter subtracts one at the boundary rather than renumbering a protocol clients depend on.
+- **Contributed types.** A crew log keeps one guest type namespace, `app:<name>/<action>`, and grants it to the `member` kind; the contribution protocol spells the same thing `<app>/<action>`. The stored form carries the `app:` prefix so the log's own ownership rule decides the write, and the emitter is derived from the type so a caller cannot attribute an entry to a different app. Reads give the protocol spelling back.
 
-Listing the roster reads only each log's header line, so listing cost follows the number of members, not the size of their logs.
+Damage is answered at three grains. A torn trailing line — trailing bytes that are not a complete line — is repaired by truncating to the last committed byte, and load then returns normally. A damaged line *inside* the committed region costs a reader that line and nothing else: refusing the whole file would turn one unreadable entry into a member whose entire history is unopenable, and the entry is unrecoverable either way. An unreadable **header** is fatal and raises `LogCorrupt`, because without it nothing in the file is attributable to this member; `members.record_activity` reports that as `False` and `members.read_activity` as `[]` rather than raising.
+
+Writes are serialized per member in-process and across processes by the store's own lock, which re-reads committed state under the lock so a second writer takes the next `seq` rather than duplicating one.
+
+Listing the roster reads only each log's header line, so listing cost follows the number of members, not the size of their logs. The slug comes from the header rather than the directory name, and only when it folds back to the directory it was found in — the fold is not reversible, and a directory carrying another unit's id must not be enumerated as that other unit.
 
 ## 3. Event vocabulary
 

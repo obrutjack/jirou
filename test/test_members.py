@@ -10,6 +10,8 @@ import json
 
 import pytest
 
+from kiro_crew.crew_log.schema import KIND_MEMBER
+from kiro_crew.crew_log.store import ledger_path
 from kiro_crew.members import (
     ACTIVITY_FILE_NAME,
     MemberSlugError,
@@ -20,6 +22,16 @@ from kiro_crew.members import (
     slug_for_name,
     validate_slug,
 )
+
+
+def _log_path(slug: str):
+    """Where a member's append-only log lives: inside the fenced ``crew-log`` tree.
+
+    Asked of the store rather than composed here. The directory under it is a
+    readable-plus-digest fold of the slug, so a hand-built path would be wrong,
+    and asking means these tests follow the layout instead of pinning a copy of it.
+    """
+    return ledger_path(KIND_MEMBER, slug)
 
 
 class TestSlugForName:
@@ -134,12 +146,12 @@ class TestRecordActivity:
         record_activity("M", "s2", "persistent", via="chat")
         assert [r["session"] for r in read_activity("m")] == ["s1", "s2"]
 
-    def test_creates_the_member_directory_on_demand(self):
-        # The member's space is now the per-member append-only log, not the
-        # rotated activity.jsonl: record_activity ensures log.jsonl exists with
-        # a header line followed by one activity/record envelope.
+    def test_creates_the_member_log_on_demand(self):
+        # The member's space is the per-member append-only log, kept as a
+        # ``member``-kind crew log: record_activity ensures it exists with a
+        # header line followed by one activity/record envelope.
         record_activity("Brand New", "s1", "persistent")
-        log = member_dir("brand-new") / "log.jsonl"
+        log = _log_path("brand-new")
         assert log.is_file()
         lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
         assert len(lines) == 2  # header + one activity/record
@@ -237,8 +249,13 @@ class TestRecordActivity:
     def test_reports_failure_instead_of_raising(self, monkeypatch):
         # Total by contract: the call sites have no guard, and one of them
         # (mcp_core) has no logger, so a raise here would surface as a tool error.
+        # Patched at the service lookup because that is the first thing on the
+        # write path now that the log's location comes from the store, not from
+        # member_dir -- a patch on the old path would pass without proving
+        # anything.
         monkeypatch.setattr(
-            "kiro_crew.members.member_dir", lambda _s: (_ for _ in ()).throw(OSError("boom"))
+            "kiro_crew.eventlog.service.get_service",
+            lambda: (_ for _ in ()).throw(OSError("boom")),
         )
         assert record_activity("M", "s1", "persistent") is False
 
@@ -255,6 +272,9 @@ class TestReadActivity:
         # line. The next record must not be glued onto it, or BOTH are lost.
         record_activity("M", "s1", "persistent")
         path = member_dir("m") / ACTIVITY_FILE_NAME
+        # The member directory holds only the LEGACY file now -- the log moved
+        # under the fenced crew-log tree -- so nothing has created it yet.
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write('{"ts":"x","session":"torn"')  # no newline: torn write
         record_activity("M", "s2", "persistent")
@@ -263,6 +283,7 @@ class TestReadActivity:
     def test_skips_torn_lines_and_keeps_the_rest(self):
         record_activity("M", "s1", "persistent")
         path = member_dir("m") / ACTIVITY_FILE_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write("\n{not valid json\n")
         record_activity("M", "s2", "persistent")
@@ -271,6 +292,7 @@ class TestReadActivity:
     def test_skips_non_object_rows(self):
         record_activity("M", "s1", "persistent")
         path = member_dir("m") / ACTIVITY_FILE_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write("\n" + json.dumps(["not", "a", "dict"]))
         assert len(read_activity("m")) == 1
@@ -295,11 +317,14 @@ class TestNoRotationAppendOnly:
         n = 40
         for i in range(n):
             assert record_activity("M", f"s{i}", "persistent")
-        log = member_dir("m") / "log.jsonl"
+        log = _log_path("m")
         lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
         # Exactly the header + one line per record; nothing rotated aside.
         assert len(lines) == n + 1
-        assert not (member_dir("m") / "log.jsonl.1").exists()
+        # Retention in this store is dropping whole segments off the front, and
+        # nothing rotates yet, so a second segment would mean the append-only
+        # claim had been broken.
+        assert [p.name for p in log.parent.glob("log.*.jsonl")] == []
 
     def test_read_limit_returns_most_recent_oldest_first(self):
         n = 10
@@ -328,19 +353,19 @@ class TestNoRotationAppendOnly:
 
 
 class TestLogCorruptionContract:
-    """The append-only log's corruption contract, replacing the old over-cap /
-    CR-delimited legacy-reader suite.
+    """The append-only log's damage contract, now that the log is a crew log.
 
-    A torn TRAILING line (partial write, no newline) is repaired by truncation
-    on load, and the next record_activity appends with a contiguous seq. A
-    corrupted line INSIDE the committed region raises LogCorrupt in the log
-    layer; record_activity is best-effort (returns False without raising) and
-    read_activity degrades to [] rather than propagating.
+    A torn TRAILING line (partial write, no newline) is repaired by truncation on
+    load, and the next record_activity appends with a contiguous seq. A damaged
+    line INSIDE the committed region costs a reader that line and nothing else.
+    An unreadable HEADER is the fatal case -- without it nothing in the file is
+    attributable -- and it raises LogCorrupt in the log layer, which
+    record_activity reports as False and read_activity as [] rather than raising.
 
     The service caches a loaded MemberLog per slug, so a file mutated behind
     its back is only observed after the singleton is dropped — these tests
     ``set_service(None)`` to force the next call to reload from disk, which is
-    exactly the cold-start / other-process path the corruption contract exists
+    exactly the cold-start / other-process path the damage contract exists
     for (a live process never tears its own committed region).
     """
 
@@ -352,10 +377,10 @@ class TestLogCorruptionContract:
 
     def test_torn_trailing_line_is_repaired_and_next_append_is_contiguous(self):
         assert record_activity("M", "s1", "persistent")
-        log = member_dir("m") / "log.jsonl"
+        log = _log_path("m")
         # A write interrupted before its newline leaves a torn trailing line.
         with open(log, "a", encoding="utf-8") as fh:
-            fh.write('{"type":"activity/record","seq":1,"time":123,"dat')
+            fh.write('{"type":"activity/record","seq":2,"time":123,"dat')
         self._reset_service()
         # The next record reloads, repairs (truncates) the torn tail, and
         # appends with a contiguous seq — no gap, no lost record.
@@ -364,41 +389,58 @@ class TestLogCorruptionContract:
         assert [r["session"] for r in rows] == ["s1", "s2"]
         lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
         assert len(lines) == 3  # header + two committed records
-        assert [json.loads(ln)["seq"] for ln in lines[1:]] == [0, 1]
+        # On disk the header is seq 0, so the two records are 1 and 2. The wire
+        # numbering this surface has always used starts the first EVENT at 0, and
+        # that translation is the log adapter's job, not the file's.
+        assert [json.loads(ln)["seq"] for ln in lines[1:]] == [1, 2]
 
-    def test_committed_corruption_makes_record_activity_return_false(self):
-        # A corrupted line INSIDE the committed region (newline-terminated) is
-        # not a torn tail — the log layer raises LogCorrupt on reload.
-        # record_activity is documented best-effort, so it returns False.
-        assert record_activity("M", "s1", "persistent")
-        log = member_dir("m") / "log.jsonl"
-        with open(log, "a", encoding="utf-8") as fh:
-            fh.write("not valid json at all\n")  # committed corruption
-        self._reset_service()
-        assert record_activity("M", "s2", "persistent", dedupe_session=True) is False
+    def test_a_damaged_committed_line_costs_that_line_and_nothing_else(self):
+        """A damaged line inside the committed region is skipped, not fatal.
 
-    def test_committed_corruption_makes_read_activity_return_empty(self):
+        This changed with the move into the crew log store and the new answer is
+        the better one for a record whose purpose is to survive damage: refusing
+        the file turns one bad line into a member whose entire history is
+        unreadable, and the bad line is unrecoverable either way. So the reads
+        keep working and the next append still lands.
+        """
         assert record_activity("M", "s1", "persistent")
-        log = member_dir("m") / "log.jsonl"
+        log = _log_path("m")
         with open(log, "a", encoding="utf-8") as fh:
-            fh.write("not valid json at all\n")
+            fh.write("not valid json at all\n")  # committed damage
         self._reset_service()
-        # read_activity swallows the corruption and returns [] rather than
-        # raising through to the drawer/counters.
+
+        assert record_activity("M", "s2", "persistent")
+        assert [r["session"] for r in read_activity("m")] == ["s1", "s2"]
+
+    def test_an_unreadable_header_degrades_both_public_funcs(self):
+        """Without a header nothing in the file is attributable, so it IS fatal.
+
+        That is the difference from one damaged line, and it is the case the
+        ``LogCorrupt`` contract now covers: record_activity is documented
+        best-effort so it reports False, and read_activity degrades to [] rather
+        than raising through to the drawer and the counters.
+        """
+        assert record_activity("M", "s1", "persistent")
+        log = _log_path("m")
+        lines = log.read_text(encoding="utf-8").splitlines(keepends=True)
+        log.write_text("garbage header\n" + "".join(lines[1:]), encoding="utf-8")
+        self._reset_service()
+
+        assert record_activity("M", "s2", "persistent") is False
         assert read_activity("m") == []
 
     def test_corruption_contract_matches_the_service(self):
         # Guard the claim against drift: the log layer really raises LogCorrupt
-        # on committed corruption, and both public members funcs convert that
+        # for an unreadable header, and both public members funcs convert that
         # into their non-raising contracts once the stale in-memory log is gone.
         from kiro_crew.eventlog.log import LogCorrupt, MemberLog
 
         assert record_activity("M", "s1", "persistent")
-        log = member_dir("m") / "log.jsonl"
-        with open(log, "a", encoding="utf-8") as fh:
-            fh.write("garbage\n")
+        log = _log_path("m")
+        lines = log.read_text(encoding="utf-8").splitlines(keepends=True)
+        log.write_text("garbage header\n" + "".join(lines[1:]), encoding="utf-8")
         with pytest.raises(LogCorrupt):
-            MemberLog(log).load()
+            MemberLog("m").load()
         self._reset_service()
         assert record_activity("M", "s2", "persistent") is False
         assert read_activity("m") == []

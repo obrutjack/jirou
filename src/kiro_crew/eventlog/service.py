@@ -2,7 +2,7 @@
 
 Contract (implemented in this module; callers import only from here):
 
-    svc = get_service()                       # lazy singleton rooted at members.members_root()
+    svc = get_service()                       # lazy singleton rooted at the member crew log root
     svc.attach_broadcast(state.broadcast_ws)  # once, at dashboard startup
     svc.ensure(slug, name)                    # create the log + header if missing (migrates legacy files)
     ev = svc.append(slug, type, data)         # write + fsync, fold projections, push member_projection frames
@@ -25,6 +25,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
+from kiro_crew.crew_log.schema import KIND_MEMBER
 from kiro_crew.eventlog import types
 from kiro_crew.eventlog.log import MemberLog
 from kiro_crew.eventlog.members_projections import all_units
@@ -77,8 +78,6 @@ UNIT_KIND = "member"
 
 _singleton: "MemberEventLogService | None" = None
 _singleton_lock = threading.Lock()
-
-_LOG_FILE_NAME = "log.jsonl"
 
 
 def _read_legacy_activity_files(slug: str) -> list[dict]:
@@ -152,7 +151,13 @@ class MemberEventLogService:
 
     @property
     def root(self) -> Path:
-        """The members root this service is bound to."""
+        """The ``member`` crew log root this service is bound to.
+
+        Read by :func:`get_service` to decide whether the cached singleton still
+        belongs to the process's data home: the root moves when the home moves,
+        which every test does and production never does, and a service holding
+        logs opened under the old root would answer from files nothing writes.
+        """
         return self._root
 
     @property
@@ -197,9 +202,16 @@ class MemberEventLogService:
 
     # ---- internal plumbing ------------------------------------------------
     def _log_path(self, slug: str) -> Path:
-        from kiro_crew.members import member_dir
+        """Where this member's log lives -- inside the fenced ``crew-log`` tree.
 
-        return member_dir(slug) / _LOG_FILE_NAME
+        The store owns the layout, including the readable-plus-digest fold of the
+        slug that names the directory, so this asks it rather than composing a
+        path. That is what puts the file under the root the sandbox masks and the
+        agent file tools refuse.
+        """
+        from kiro_crew.crew_log.store import ledger_path
+
+        return ledger_path(KIND_MEMBER, slug)
 
     def _slug_lock(self, slug: str) -> threading.Lock:
         with self._map_lock:
@@ -214,10 +226,9 @@ class MemberEventLogService:
         with self._map_lock:
             log = self._logs.get(slug)
         if log is None:
-            path = self._log_path(slug)
-            if not path.exists():
+            log = MemberLog(slug)
+            if not log.exists():
                 return None
-            log = MemberLog(path)
             log.load()
             events = log.all_events()
             if log.header is not None:
@@ -238,12 +249,11 @@ class MemberEventLogService:
         from kiro_crew.members import validate_slug
 
         validate_slug(slug)
-        path = self._log_path(slug)
         lock = self._slug_lock(slug)
         with lock:
-            if path.exists():
+            log = MemberLog(slug)
+            if log.exists():
                 return
-            log = MemberLog(path)
             log.create(name)
             log.load()
             self._names[slug] = name
@@ -284,13 +294,16 @@ class MemberEventLogService:
             self._append_locked(slug, log, types.ACTIVITY_RECORD, row)
 
     def slugs(self) -> list[str]:
-        out: list[str] = []
-        if not self._root.exists():
-            return out
-        for child in self._root.iterdir():
-            if child.is_dir() and (child / _LOG_FILE_NAME).exists():
-                out.append(child.name)
-        return sorted(out)
+        """Every member with a log, sorted.
+
+        Asks the store rather than listing a directory: under ``crew-log`` a unit's
+        directory is named with a readable-plus-digest FOLD of the slug, and the
+        fold is not reversible, so the slug comes from each log's header and only
+        when that header's id folds back to the directory holding it.
+        """
+        from kiro_crew.crew_log.store import unit_ids
+
+        return unit_ids(KIND_MEMBER)
 
     # ---- write ------------------------------------------------------------
     def append(self, slug: str, type: str, data: dict) -> Event:
@@ -369,12 +382,12 @@ class MemberEventLogService:
 
 
 def get_service() -> MemberEventLogService:
-    """Lazy process-wide singleton rooted at ``kiro_crew.members.members_root()``."""
+    """Lazy process-wide singleton rooted at the ``member`` crew log root."""
     global _singleton
     with _singleton_lock:
-        from kiro_crew.members import members_root
+        from kiro_crew.crew_log.store import ledger_root
 
-        root = members_root()
+        root = ledger_root(KIND_MEMBER)
         # A service is bound to the root it was created for. The root only
         # moves when the process's data home moves — never in production, but
         # every test repoints it — and a cached MemberLog from the old root
