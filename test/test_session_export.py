@@ -892,3 +892,242 @@ def test_gzip_is_deterministic_for_one_document():
     document = {"bundle_version": 2, "messages": [{"role": "user", "content": "hi", "ts": ""}]}
     assert se.gzip_bundle(document) == se.gzip_bundle(document)
     assert json.loads(gzip.decompress(se.gzip_bundle(document))) == document
+
+
+# -- Layer A path scrub (always on) ----------------------------------------
+
+
+# Composed at runtime so the login-bearing path never appears as a source
+# literal (same reason the provenance test above builds its paths from
+# ``login``): the runtime strings are identical to typing the path out.
+_PATH_LOGIN = "somelogin"
+_PATH = f"/local/home/{_PATH_LOGIN}/proj/x.py"
+
+_PATH_MSGS = [
+    {"role": "user", "content": f"why does {_PATH} fail?", "ts": "t1"},
+    {"role": "assistant", "content": f"check {_PATH} line 3", "ts": "t2"},
+]
+
+
+@pytest.mark.asyncio
+async def test_export_scrubs_local_paths_from_both_roles():
+    """Every file export runs ``redact_local_paths`` over Layer A.
+
+    There is no opt-in: a downloaded file leaves the host, so a bare local path
+    is scrubbed on every export. The scrub reaches USER turns as well as
+    assistant ones -- a bare path is host-identifying wherever it sits, and it is
+    a placeholder rather than a corruption of the human's words -- so the
+    login-bearing string appears NOWHERE in the serialized bundle, and each
+    scrubbed path is replaced by the disclosed ``[redacted-path]`` marker rather
+    than silently deleted.
+    """
+    slot = _slot(_PATH_MSGS, title="a plain title")
+    state = _state(_PATH_MSGS, slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state))
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+
+    bodies = [m["content"] for m in document["messages"]]
+    # Both roles were scrubbed. The prefix check drops the filename so a partial
+    # scrub that kept the directory would still fail it.
+    assert all(f"/local/home/{_PATH_LOGIN}" not in b for b in bodies)
+    assert any("[redacted-path]" in b for b in bodies)  # assistant
+    assert document["messages"][0]["role"] == "user"
+    assert "[redacted-path]" in document["messages"][0]["content"]
+    # The login string is gone from the WHOLE serialized bundle.
+    assert _PATH_LOGIN not in json.dumps(document)
+
+
+@pytest.mark.asyncio
+async def test_export_scrubs_paths_inside_fenced_code_too():
+    """The file export scrubs the WHOLE body, fenced code included.
+
+    Agent transcripts concentrate paths in fenced tool output (``cwd``, ``ls``
+    listings), so a carve-out would leave the login and on-disk layout in the
+    download exactly where they are densest. A path inside a fenced block is
+    redacted like any other; non-path code lines are untouched because the
+    redactor matches only filesystem paths.
+    """
+    code = f"```python\nsource = {_PATH!r}\nvalue = 1\n```"
+    msgs = [
+        {"role": "user", "content": f"inspect {_PATH}\n{code}\nafter {_PATH}", "ts": "t1"},
+        {"role": "assistant", "content": f"check {_PATH}\n{code}\nthen {_PATH}", "ts": "t2"},
+    ]
+    slot = _slot(msgs, title="a plain title")
+    state = _state(msgs, slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state))
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+
+    for message in document["messages"]:
+        assert message["content"].count("[redacted-path]") == 3
+        assert _PATH_LOGIN not in message["content"]
+        assert "value = 1" in message["content"]
+
+
+# Built at runtime from two halves so the added source line carries no literal
+# credential-shaped token for the content scan, while the value the redactor
+# sees at run time is an ordinary access-key-id shape.
+_FAKE_AKID = "AKIA" + "ABCDEFGHIJKLMNOP"
+
+
+@pytest.mark.asyncio
+async def test_export_scrubs_inline_and_unclosed_backtick_spans():
+    """Inline and unclosed backtick spans are scrubbed like any other body."""
+    msgs = [
+        {"role": "user", "content": f"inline ```{_PATH}``` tail", "ts": "t1"},
+        {"role": "assistant", "content": f"```python\npath = {_PATH!r}", "ts": "t2"},
+    ]
+    slot = _slot(msgs, title="a plain title")
+    state = _state(msgs, slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state))
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+    assert document["messages"][0]["content"] == "inline ```[redacted-path]``` tail"
+    assert _PATH_LOGIN not in document["messages"][1]["content"]
+    assert "[redacted-path]" in document["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_export_scrubs_a_path_after_a_closing_fence_on_the_same_line():
+    """A closing fence line may carry only whitespace: a path written after the
+    closing backticks on that line is prose and is scrubbed, not preserved."""
+    body = f"```python\nx = 1\n``` see {_PATH}"
+    msgs = [{"role": "assistant", "content": body, "ts": "t1"}]
+    slot = _slot(msgs, title="a plain title")
+    state = _state(msgs, slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state))
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+    content = document["messages"][0]["content"]
+    assert _PATH_LOGIN not in content
+    assert "[redacted-path]" in content
+    assert "x = 1" in content
+
+
+@pytest.mark.asyncio
+async def test_credential_scrub_is_assistant_only_while_path_scrub_reaches_user_turns():
+    """The two scrubs have different reach, and the docs must say so.
+
+    The credential and exfiltration-URL scrubs run on every export but only over
+    ASSISTANT bodies: user turns ship verbatim, as on the fork and import paths,
+    because redacting what the human typed would corrupt their own words. The
+    path scrub (always on) reaches BOTH roles. So a credential-shaped token in a
+    user turn survives the export, while the path beside it and the same token in
+    the assistant turn do not.
+    """
+    msgs = [
+        {"role": "user", "content": f"key {_FAKE_AKID} fails on {_PATH}", "ts": "t1"},
+        {"role": "assistant", "content": f"rotate {_FAKE_AKID}; see {_PATH}", "ts": "t2"},
+    ]
+    slot = _slot(msgs, title="a plain title")
+    state = _state(msgs, slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state))
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+    user, assistant = document["messages"]
+    assert user["role"] == "user" and assistant["role"] == "assistant"
+
+    # User turn: path scrubbed, credential-shaped token left as typed.
+    assert user["content"] == f"key {_FAKE_AKID} fails on [redacted-path]"
+    # Assistant turn: both scrubbed.
+    assert _FAKE_AKID not in assistant["content"]
+    assert _PATH_LOGIN not in assistant["content"]
+    assert "[redacted-path]" in assistant["content"]
+
+
+@pytest.mark.asyncio
+async def test_export_scrubs_layer_a_and_still_carries_layer_b_on_opt_in(monkeypatch):
+    """The always-on Layer A path scrub coexists with a carried Layer B.
+
+    Layer B ships byte-exact and unredacted -- its thinking-block signatures are
+    validated on replay, so there is no redacted variant. An operator who opts
+    into Layer B is choosing to carry that unredacted context, their own accepted
+    risk (rfc-s3-backup.md O1). The Layer A scrub still runs, and nothing is
+    refused: the human-readable bodies are path-free while the resumable context
+    rides for the operator who asked.
+    """
+    import kiro_crew.dashboard.session_transfer as st
+
+    # A session that genuinely HAS resumable context, so the bundle really
+    # carries layer_b.
+    monkeypatch.setattr(st, "_resolve_layer_b_sid", lambda *_a, **_k: "a-real-sid")
+    monkeypatch.setattr(
+        st,
+        "_read_layer_b",
+        lambda sid: {"sid": sid, "envelope": {}, "events": "{}"} if sid else None,
+    )
+    monkeypatch.setattr(se, "_export_layer_b_permitted", lambda: True)
+    monkeypatch.setattr(se, "is_owner_dashboard_request", lambda *_a, **_k: True)
+
+    slot = _slot(_PATH_MSGS)
+    state = _state(_PATH_MSGS, slots={"slot-1": slot})
+    resp = await se.api_chat_slot_export(_request(state, query={"include_layer_b": "true"}))
+
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+    # Layer B rode along...
+    assert "layer_b" in document
+    # ...and Layer A message bodies are still path-scrubbed.
+    bodies = [m["content"] for m in document["messages"]]
+    assert all(f"/local/home/{_PATH_LOGIN}" not in b for b in bodies)
+    assert any("[redacted-path]" in b for b in bodies)
+
+
+@pytest.mark.asyncio
+async def test_export_scrubs_layer_a_when_no_layer_b_rides(monkeypatch):
+    """With no resumable context, Layer A is the whole payload and is
+    path-scrubbed; the export proceeds transcript-only."""
+    import kiro_crew.dashboard.session_transfer as st
+
+    # No resumable context: the builder resolves an empty sid, so no layer_b.
+    monkeypatch.setattr(st, "_resolve_layer_b_sid", lambda *_a, **_k: "")
+    monkeypatch.setattr(st, "_read_layer_b", lambda sid: None)
+    monkeypatch.setattr(se, "_export_layer_b_permitted", lambda: True)
+    monkeypatch.setattr(se, "is_owner_dashboard_request", lambda *_a, **_k: True)
+
+    slot = _slot(_PATH_MSGS)
+    state = _state(_PATH_MSGS, slots={"slot-1": slot})
+    resp = await se.api_chat_slot_export(_request(state, query={"include_layer_b": "true"}))
+
+    assert resp.status == 200
+    document = json.loads(gzip.decompress(resp.body))
+    assert "layer_b" not in document
+    assert _PATH_LOGIN not in json.dumps(document)
+
+
+@pytest.mark.asyncio
+async def test_the_export_always_scrubs_regardless_of_a_query_flag():
+    """There is no opt-in surface: a leftover ``?scrub_paths=`` query, truthy or
+    not, changes nothing -- the export scrubs Layer A either way."""
+    slot = _slot(_PATH_MSGS, title="a plain title")
+    state = _state(_PATH_MSGS, slots={"slot-1": slot})
+
+    for q in (None, {"scrub_paths": "false"}, {"scrub_paths": "true"}):
+        resp = await se.api_chat_slot_export(_request(state, query=q))
+        assert resp.status == 200
+        document = json.loads(gzip.decompress(resp.body))
+        assert _PATH_LOGIN not in json.dumps(document)
+
+
+@pytest.mark.asyncio
+async def test_the_tunnel_bundle_keeps_paths_verbatim():
+    """The path scrub is the FILE export's behavior; the builder defaults
+    ``scrub_paths`` OFF, so a tunnel send (trusted peer) is byte-identical to
+    before this feature and keeps paths verbatim."""
+    with_default = await build_transfer_bundle_async(
+        _state(_PATH_MSGS), _slot(_PATH_MSGS), origin="mac"
+    )
+    explicit_off = await build_transfer_bundle_async(
+        _state(_PATH_MSGS), _slot(_PATH_MSGS), origin="mac", scrub_paths=False
+    )
+    assert with_default == explicit_off
+    # And the tunnel default keeps the path verbatim (Layer A is not path-scrubbed
+    # on the trusted peer-to-peer hop).
+    bodies = [m["content"] for m in with_default["messages"]]
+    assert any(f"/local/home/{_PATH_LOGIN}" in b for b in bodies)

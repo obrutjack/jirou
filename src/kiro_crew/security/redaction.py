@@ -1093,16 +1093,59 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
 
 
 # Absolute filesystem paths, POSIX and Windows. Deliberately narrow: anchored to
-# real filesystem roots rather than "any slash-separated token", and both branches
-# refuse to start mid-token so a URL is never mistaken for a path -- without the
+# real filesystem roots rather than "any slash-separated token", and every branch
+# refuses to start mid-token so a URL is never mistaken for a path -- without the
 # lookbehinds, ``https://api.github.com/repos/x`` matches twice (``s:/`` as a drive
 # letter, ``/repos`` as a root) and the URL is destroyed.
+#
+# The drive-letter branch accepts BOTH separators: ``C:\`` and ``C:/`` name the
+# same file on Windows, and tools that normalise separators (Git Bash, Python's
+# pathlib/posixpath, Node, MSYS) routinely print the forward-slash spelling, so
+# matching only ``C:\`` left ``C:/Users/<login>/...`` -- the login and host
+# layout -- unredacted on the opted-in export. The forward-slash form carries a
+# ``(?!/)`` guard so a one-letter URI scheme (``x://host``) is never mistaken
+# for a drive; longer schemes (``https:``) are already refused by the
+# ``(?<![A-Za-z])`` lookbehind on the drive letter itself.
+_POSIX_PATH_HEAD = r"(?<![\w:/])/(?:local/home|home|Users|root|tmp|var|opt|usr|etc|private|mnt|srv|workspace|workplace)"
+_WIN_PATH_HEAD = r"(?<![A-Za-z])[A-Za-z]:(?:\\+|/(?!/))"
+
+# Terminal Windows profile roots can contain spaces without a trailing
+# separator. Two families of branch order the alternation:
+#
+# 1. Quoted paths (tried first). A quote that opens directly on a filesystem
+#    root is redacted whole to the matching closing quote. Prose sharing the
+#    quote with the path is redacted with it -- the accepted, disclosed cost;
+#    the source transcript is untouched so the text is recoverable.
+# 2. Unquoted paths. A terminal profile root with a spaced login redacts whole;
+#    an ordinary path redacts only its token and preserves following prose. A
+#    punctuation terminator must end the token so a dotted login (``first.last``)
+#    cannot backtrack and leak its suffix. An apostrophe is a legal filename
+#    character (``C:\Users\O'Brien``), so the unquoted token body admits it: the
+#    quoted branches above run first and consume a fully quoted path, so a bare
+#    apostrophe reaching these branches is inside a filename, not a delimiter.
+#
+# Every character class excludes a backtick so a Markdown code span never bleeds
+# into a path match.
+_LOCAL_PATH_HEAD = rf"(?:{_POSIX_PATH_HEAD}|{_WIN_PATH_HEAD})"
+_QUOTED_LOCAL_PATH = (
+    rf'(?<="){_LOCAL_PATH_HEAD}[^"\r\n]*(?=")' rf"|(?<='){_LOCAL_PATH_HEAD}[^'\r\n]*(?=')"
+)
+_WIN_PROFILE_ROOT = (
+    rf"{_WIN_PATH_HEAD}Users[\\/]+[^\s\"<>|`\\/:]+"
+    rf"(?>(?: +(?!https?://)[^\s\"<>|`\\/:]+)+)"
+    r"(?=$|[.,;:!?)}\]](?=\s|$|['\"`])|(?=['\"`])|\s+https?://)"
+)
+_POSIX_PROFILE_ROOT = (
+    r"(?<![\w:/])/(?:Users|home)/[^\s\"<>|`/]+"
+    r"(?>(?: +(?!https?://|/(?:Users|home)/)[^\s\"<>|`]+)+)"
+    r"(?=$|[.,;:!?)}\]](?=\s|$|['\"`])|(?=['\"`])|\s+https?://)"
+)
 _LOCAL_PATH_RE = re.compile(
-    r"(?:"
-    r"(?<![\w:/])/(?:local/home|home|Users|root|tmp|var|opt|usr|etc|private|mnt|srv|workspace|workplace)"
-    r"|(?<![A-Za-z])[A-Za-z]:\\"
-    r")"
-    r"[^\s'\"<>|]*"
+    rf"{_QUOTED_LOCAL_PATH}"
+    rf"|{_WIN_PROFILE_ROOT}"
+    rf"|{_POSIX_PROFILE_ROOT}"
+    rf"|{_WIN_PATH_HEAD}[^\s\"<>|`]*(?: +[^\s\"<>|`\\/:]+[\\/][^\s'\"<>|`]*)*"
+    rf"|{_POSIX_PATH_HEAD}[^\s\"<>|`]*(?: +[^\s\"<>|`\\]+\\[^\s'\"<>|`]*)*"
 )
 _LOCAL_PATH_PLACEHOLDER = "[redacted-path]"
 

@@ -53,6 +53,19 @@ because there is no context to lose.
 **Nothing here installs.** Reading such a file back is a separate, later piece of
 work; this module only produces one.
 
+**Path scrub (always on).** Every file export runs ``redact_local_paths`` over
+every visible Layer A message body (the title is path-scrubbed too), so a bare
+local filesystem path discussed in the conversation ships as ``[redacted-path]``
+rather than verbatim. This is not an opt-in and there is no raw variant: a
+downloaded file is a thing that leaves this machine, and a bare path carries the
+operator's login and on-disk layout to wherever it lands, which is not
+recoverable once shared. The marker is disclosed rather than a silent deletion,
+so the reader sees that something was removed. Fidelity loses here because the
+reader of an export wants the conversation, not the host's directory names. If
+the operator also opts into Layer B, that byte-exact context still rides (it
+cannot be redacted -- its signatures are validated on replay) as their own
+accepted risk; the Layer A scrub runs regardless.
+
 **Separate module, deliberately.** ``session_transfer`` may not answer 404 or
 405: ``SshTunnelManager.send_session_bundle`` reads those two codes from a peer
 as "that instance has no importer, tell the user to update it", and
@@ -232,6 +245,24 @@ def _export_layer_b_requested(request: web.Request) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+#: The file export ALWAYS path-scrubs Layer A message bodies -- there is no
+#: opt-in and no way to keep the raw path. An export already scrubs credentials
+#: and exfiltration URLs from every ASSISTANT body (user turns ship verbatim, as
+#: on the fork and import paths: redacting what the human typed would corrupt
+#: their own words), but a BARE local path (``/local/home/<login>/...``) carries
+#: no credential and yet discloses the operator's login and on-disk layout to
+#: whoever a downloaded file is shared with -- and a downloaded file is a thing
+#: that LEAVES this machine, so that disclosure is not recoverable once shared.
+#: ``redact_local_paths`` therefore runs over every visible Layer A body on
+#: every file export, replacing each path with the disclosed, non-reversible
+#: ``[redacted-path]`` marker so the reader can see something was removed rather
+#: than having the text silently deleted. Fidelity is the cheaper thing to give
+#: up: the reader of an export wants the conversation, not the host's directory
+#: names. The tunnel send is the deliberate exception -- its peer is the
+#: operator's own trusted instance, so it never sets this (see
+#: ``handlers_instances``).
+
+
 async def api_chat_slot_export(request: web.Request) -> web.Response:
     """GET /api/chat/slots/{slot}/export — download one session as a file."""
     state: DashboardState = request.app["state"]
@@ -299,6 +330,22 @@ async def api_chat_slot_export(request: web.Request) -> web.Response:
         )
 
     try:
+        # Layer B stays the operator's existing twofold opt-in (standing config
+        # permission + this request asked + owner-only). It ships byte-exact and
+        # CANNOT be redacted -- its thinking-block signatures are validated on
+        # replay, so there is no redacted variant. An operator who opts into
+        # Layer B is explicitly choosing to carry that unredacted context in a
+        # downloadable file, a risk decision the RFC assigns to them
+        # (rfc-s3-backup.md O1); the Layer A scrub still runs, and the bundle
+        # discloses on import that its context window is byte-exact. Withholding
+        # Layer B here would instead silently strip a feature the operator asked
+        # for, so the honest outcome is to scrub Layer A and let the operator's
+        # own Layer B choice stand.
+        include_layer_b = (
+            _export_layer_b_permitted()
+            and _export_layer_b_requested(request)
+            and is_owner_dashboard_request(request)
+        )
         bundle = await build_transfer_bundle_async(
             state,
             slot,
@@ -336,11 +383,16 @@ async def api_chat_slot_export(request: web.Request) -> web.Response:
             # ``include_layer_b`` also withholds on its own for a mid-turn snapshot,
             # a v1 sender, or a session that never opened a context; this caller
             # only supplies the operator's opt-in on top of that.
-            include_layer_b=(
-                _export_layer_b_permitted()
-                and _export_layer_b_requested(request)
-                and is_owner_dashboard_request(request)
-            ),
+            include_layer_b=include_layer_b,
+            # The file export ALWAYS path-scrubs Layer A: runs
+            # ``redact_local_paths`` over every visible body (the title
+            # is path-scrubbed too), so a bare local path discussed in the
+            # conversation ships as the disclosed ``[redacted-path]`` marker
+            # rather than verbatim. Not an opt-in and no raw variant. The tunnel
+            # send passes the default False -- its peer is the operator's own
+            # trusted instance, where the scrub would cost fidelity for no
+            # privacy gain.
+            scrub_paths=True,
         )
     except SnapshotUnstable:
         # No consistent view of the source: a flush landed inside every retry, or
@@ -371,6 +423,13 @@ async def api_chat_slot_export(request: web.Request) -> web.Response:
             {"error": "the session could not be exported", "code": "export_failed"},
             status=500,
         )
+
+    # Layer A message bodies are path-scrubbed on every export.
+    # Layer B, when the operator opted into it, still rides byte-exact: its
+    # signatures are validated on replay so it cannot be redacted, and the
+    # operator's twofold opt-in is their own accepted risk that unredacted
+    # context leaves in the file. The scrub and the opt-in coexist rather than
+    # one refusing the other -- there is nothing to reject here.
 
     if not bundle.get("messages"):
         # Refused here rather than handed over, because the importer's floor

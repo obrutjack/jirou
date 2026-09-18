@@ -232,6 +232,7 @@ class SnapshotUnstable(RuntimeError):
 #: they reference local tool state that means nothing on the target instance.
 _VISIBLE_ROLES = ("user", "assistant")
 
+
 #: Prefix marking an imported session in the sidebar, so a transferred tab is
 #: never mistaken for one that originated locally.
 _IMPORT_TITLE_MARKER = "⇄ "
@@ -733,6 +734,7 @@ async def build_transfer_bundle_async(
     origin: str = "",
     with_source: bool = False,
     include_layer_b: bool = True,
+    scrub_paths: bool = False,
 ) -> dict[str, Any]:
     """Serialise *slot*'s visible conversation into a portable bundle, with the
     disk read off the event loop.
@@ -812,6 +814,26 @@ async def build_transfer_bundle_async(
     transfer is a copy, so the source is untouched and the user can just retry —
     which makes it strictly better than either losing turns or wedging the
     gateway.
+
+    *scrub_paths* runs ``redact_local_paths`` over every visible ``user`` and
+    ``assistant`` body (the title is path-scrubbed on every export regardless),
+    so a bare local filesystem path discussed in the conversation (a Linux home
+    directory, a Windows user profile) ships as the disclosed ``[redacted-path]``
+    marker rather than verbatim. The file export always sets it:
+    a downloaded file leaves this machine, and a bare path carries the operator's
+    login and on-disk layout to wherever it lands. The tunnel send never sets it,
+    because the peer is the operator's own trusted instance, so the scrub would
+    cost fidelity for no privacy gain. Unlike the credential scrub, the path
+    scrub is applied to USER turns too: a bare path is host-identifying wherever
+    it sits, and unlike a credential it is not the human's own words being
+    corrupted, since a placeholder loses only the path.
+
+    Layer B, when the file export's caller opted into it, still rides byte-exact
+    and unredacted (its thinking-block signatures are validated on replay, so
+    there is no redacted variant). The Layer A path scrub and a carried Layer B
+    coexist: the scrub keeps the human-readable bodies free of host paths, while
+    Layer B is the operator's own accepted risk that unredacted context leaves
+    in the file. This builder only applies whichever the caller asked for.
     """
     # slot_history_key, NOT effective_session_key: this addresses a TRANSCRIPT
     # PATH, and for a channel-born slot the dashboard could not bind, the session
@@ -994,6 +1016,7 @@ async def build_transfer_bundle_async(
             layer_b_sid,
             layer_b_withheld,
             source,
+            scrub_paths,
         )
         # Re-check the guards AFTER the await, not only before it. A rewind or a
         # mid-stream flush can land during the threaded read, and the boundary
@@ -1061,6 +1084,7 @@ def _read_and_assemble(
     layer_b_sid: str = "",
     layer_b_skipped: bool = False,
     source: dict[str, Any] | None = None,
+    scrub_paths: bool = False,
 ) -> dict[str, Any]:
     """Read the transcript + Layer B and assemble the bundle. **Runs in a thread.**
 
@@ -1079,7 +1103,9 @@ def _read_and_assemble(
         # no resumable context behind it. Distinct from ``layer_b_sid == ""``,
         # which means there was never a context to carry.
         layer_b_skipped = True
-    return _assemble_bundle(history, title, agent, origin, layer_b, layer_b_skipped, source)
+    return _assemble_bundle(
+        history, title, agent, origin, layer_b, layer_b_skipped, source, scrub_paths
+    )
 
 
 def _assemble_bundle(
@@ -1090,6 +1116,7 @@ def _assemble_bundle(
     layer_b: dict[str, Any] | None = None,
     layer_b_skipped: bool = False,
     source: dict[str, Any] | None = None,
+    scrub_paths: bool = False,
 ) -> dict[str, Any]:
     """Turn a merged transcript into the wire bundle. Pure — thread-safe.
 
@@ -1100,6 +1127,14 @@ def _assemble_bundle(
     *source* is the optional provenance record of :func:`build_source_record`.
     It is omitted when empty and the tunnel path passes none, so a bundle sent
     over a tunnel is byte-identical with and without this feature.
+
+    *scrub_paths* runs ``redact_local_paths`` over every visible body, turning a
+    bare local filesystem path into the disclosed ``[redacted-path]`` marker. The
+    title is NOT this flag's doing: it is path-scrubbed unconditionally below, on
+    every export. Applied to USER turns as well as assistant ones, because a bare
+    path is host-identifying wherever it sits, and it is a placeholder rather than
+    a corruption of the human's own words. The file export always sets it; the
+    tunnel send never does, so a tunnel bundle is byte-identical to before.
     """
     messages: list[dict[str, Any]] = []
     for m in all_messages:
@@ -1120,6 +1155,19 @@ def _assemble_bundle(
         if role != "user":
             content, _ = redact_exfiltration_urls(content)
             content, _ = redact_credentials(content)
+        # The path scrub runs on EVERY visible body -- user turns included -- on
+        # the file export, which always sets ``scrub_paths``. A
+        # bare local path is host-identifying wherever it sits, and unlike a
+        # credential it is a placeholder that loses only the path rather than
+        # corrupting the human's own words, so there is no reason to spare user
+        # turns here the way the credential scrub above does. The scrub covers
+        # the WHOLE body, fenced code included: agent transcripts concentrate
+        # paths in fenced tool output (``cwd``, ``ls`` listings), so a carve-out
+        # would leave the login and on-disk layout in the download exactly where
+        # they are densest. The tunnel send passes False (trusted peer), so this
+        # is skipped there.
+        if scrub_paths:
+            content, _ = redact_local_paths(content)
         messages.append({"role": role, "content": content, "ts": m.get("ts", "")})
 
     # Strip our own marker so a session bounced back and forth does not

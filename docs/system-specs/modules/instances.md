@@ -1607,6 +1607,32 @@ view of the transcript could be taken (`export_snapshot_unstable`, retryable);
 `500` any other assembly failure (`export_failed`). SEL-audited as
 `chat.slot_export`.
 
+**Path scrub (always on).** Every file export scrubs credentials
+and exfiltration URLs from every `assistant` body (user turns ship verbatim, as
+on the fork and import paths above: redacting what the human typed would corrupt
+their own words), and additionally runs `redact_local_paths` over every visible
+`user` and `assistant` body, so a bare local filesystem path
+(`/local/home/<login>/...`) discussed in the conversation ships as the disclosed
+`[redacted-path]` marker rather than verbatim (the title is path-scrubbed too).
+The scrub covers the WHOLE body, Markdown fenced code included: agent transcripts
+concentrate paths in fenced tool output (a `cwd`, an `ls` listing), so sparing
+fences would leave the login and on-disk layout in the download exactly where
+they are densest. Non-path text inside a fence is untouched, because the redactor
+matches only filesystem paths. This is **not an opt-in and there
+is no raw variant**: a downloaded file leaves
+the host, a bare path carries the operator's login and on-disk layout to wherever
+it lands, and that disclosure is not recoverable once shared, so fidelity loses
+to path-privacy — the reader of an export wants the conversation, not the host's
+directory names. The marker is disclosed rather than a silent deletion, so a
+reader sees that something was removed. Unlike the credential scrub the path
+scrub reaches USER turns too — a bare path is host-identifying wherever it sits,
+and it is a placeholder rather than a corruption of the human's words. Layer B,
+when the operator opts into it (below), still rides byte-exact and unredacted:
+that is the operator's own accepted risk (`rfc-s3-backup.md` O1), the Layer A
+scrub runs regardless, and nothing is refused. The trusted tunnel send never
+path-scrubs — its peer is the operator's own instance, so the scrub would cost
+fidelity for no privacy gain.
+
 **Owning the slot is not owning the transcript.** A channel-linked slot displays a
 conversation that lives on the channel's own session, and `get_or_create_slot`
 auto-binds that link from a channel-shaped slot NAME, which the creating caller

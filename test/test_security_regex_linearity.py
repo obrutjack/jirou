@@ -222,3 +222,36 @@ def test_credential_pattern_module_still_compiles_one_alternation() -> None:
     assert "_CREDENTIAL_PATTERNS.finditer(text)" in body
     assert "_might_contain_credential(text)" in body
     assert "re.compile(" not in body
+
+
+def test_local_path_redaction_handles_spaced_profile_input_in_linear_time() -> None:
+    """A long, path-shaped body must not backtrack quadratically."""
+    from kiro_crew.security.redaction import redact_local_paths
+
+    text = "C:/Users/" + ("component " * 20_000)
+    started = time.perf_counter()
+    redacted, _ = redact_local_paths(text)
+    elapsed = time.perf_counter() - started
+
+    assert redacted.startswith("[redacted-path]")
+    assert elapsed < 2.0
+
+
+def test_local_path_redaction_is_linear_on_repeated_path_heads() -> None:
+    """Repeated path-head tokens must not drive the profile branches to O(n^2).
+
+    The repeated unit is itself a path head (``/home/a ``), so a profile branch
+    that rescanned every following token from each start position would be
+    quadratic. The spaced continuation is atomic and refuses a nested head, so
+    each token redacts on its own in linear time.
+    """
+    from kiro_crew.security.redaction import redact_local_paths
+
+    text = "/home/a " * 20_000
+    started = time.perf_counter()
+    redacted, _ = redact_local_paths(text)
+    elapsed = time.perf_counter() - started
+
+    assert "[redacted-path]" in redacted
+    assert "/home/a" not in redacted
+    assert elapsed < 2.0

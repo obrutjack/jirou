@@ -319,3 +319,227 @@ class TestLocalPathRootAnchors:
         # The anchor is ``/local/home`` specifically, not a bare ``/local`` --
         # a directory like ``/localstack`` must not be swept up.
         assert redaction_mod.redact_local_paths("/localstack/data")[0] == "/localstack/data"
+
+
+class TestWindowsDrivePaths:
+    """The drive-letter branch of ``redact_local_paths`` must accept BOTH
+    separators. ``C:\\`` and ``C:/`` name the same file on Windows, and tools
+    that normalise separators (Git Bash, pathlib, Node) print the forward-slash
+    spelling, so a backslash-only branch leaked ``C:/Users/<login>/...`` -- the
+    login and host layout -- through the opted-in session export."""
+
+    def test_forward_slash_windows_user_path_is_redacted(self) -> None:
+        red, notes = redaction_mod.redact_local_paths("C:/Users/Alice/project/x.py")
+        assert red == "[redacted-path]"
+        assert notes
+
+    def test_backslash_windows_user_path_is_redacted(self) -> None:
+        red, notes = redaction_mod.redact_local_paths("C:\\Users\\Alice\\project\\x.py")
+        assert red == "[redacted-path]"
+        assert notes
+
+    def test_unquoted_windows_path_with_apostrophe_is_redacted_whole(self) -> None:
+        """An apostrophe is valid inside an unquoted Windows filename."""
+        path = "C:\\Users\\O'Brien\\project"
+        red, notes = redaction_mod.redact_local_paths(path)
+        assert red == "[redacted-path]"
+        assert "Brien" not in red
+        assert notes
+
+    def test_forward_slash_drive_inside_prose_keeps_surrounding_text(self) -> None:
+        red = redaction_mod.redact_local_paths("edited C:/Users/Alice/project/x.py just now")[0]
+        assert red == "edited [redacted-path] just now"
+
+    def test_a_url_is_not_mistaken_for_a_forward_slash_drive(self) -> None:
+        # ``s:/`` inside ``https://`` must not read as a drive letter -- the
+        # ``(?<![A-Za-z])`` lookbehind refuses a drive that starts mid-scheme.
+        url = "https://api.github.com/repos/x"
+        assert redaction_mod.redact_local_paths(url)[0] == url
+
+    def test_a_one_letter_uri_scheme_is_not_a_drive(self) -> None:
+        # ``x://host`` clears the lookbehind (nothing before ``x``), so only the
+        # ``(?!/)`` guard separates it from ``x:/path``.
+        url = "x://host/path"
+        assert redaction_mod.redact_local_paths(url)[0] == url
+
+
+class TestQuotedPathsWithSpaces:
+    """A quote opening on a filesystem root redacts whole to the closing quote.
+
+    Prose sharing the quote with the path is redacted with it -- the accepted,
+    disclosed over-redaction, recoverable from the intact source transcript.
+    """
+
+    def test_double_quoted_backslash_path_with_spaces(self) -> None:
+        red, notes = redaction_mod.redact_local_paths('"C:\\Program Files\\Kiro\\log.txt"')
+        assert red == '"[redacted-path]"'
+        assert notes
+
+    def test_double_quoted_forward_slash_path_with_spaces(self) -> None:
+        red = redaction_mod.redact_local_paths('"C:/Users/Alice Smith/My Documents/x.txt"')[0]
+        assert red == '"[redacted-path]"'
+
+    def test_single_quoted_posix_path_with_spaces(self) -> None:
+        red = redaction_mod.redact_local_paths(
+            "[Errno 2] No such file or directory: '/Users/Alice Smith/Library/Application Support/x'"
+        )[0]
+        assert red == "[Errno 2] No such file or directory: '[redacted-path]'"
+
+    def test_apostrophe_inside_a_double_quoted_path_does_not_cut_it(self) -> None:
+        red = redaction_mod.redact_local_paths('"C:\\Users\\O\'Brien\\docs\\a.txt"')[0]
+        assert red == '"[redacted-path]"'
+
+    def test_a_quoted_url_with_spaces_is_left_alone(self) -> None:
+        text = '"https://example.com/repos/space here"'
+        assert redaction_mod.redact_local_paths(text)[0] == text
+
+    def test_an_unterminated_quote_uses_the_bare_path_token(self) -> None:
+        red = redaction_mod.redact_local_paths('"C:/Users/Alice/x and more')[0]
+        assert red == '"[redacted-path] and more'
+
+    def test_a_newline_ends_a_quoted_path_before_a_later_quote(self) -> None:
+        red = redaction_mod.redact_local_paths('"C:/Users/Alice/x\nnext "q"')[0]
+        assert red == '"[redacted-path]\nnext "q"'
+
+    def test_double_quoted_backslash_windows_profile_root(self) -> None:
+        red, notes = redaction_mod.redact_local_paths('"C:\\Users\\Alice Smith"')
+        assert red == '"[redacted-path]"'
+        assert "Smith" not in red
+        assert notes
+
+    def test_double_quoted_forward_slash_windows_profile_root(self) -> None:
+        red = redaction_mod.redact_local_paths('"C:/Users/Alice Smith"')[0]
+        assert red == '"[redacted-path]"'
+        assert "Smith" not in red
+
+    def test_single_quoted_windows_profile_roots(self) -> None:
+        assert redaction_mod.redact_local_paths("'C:\\Users\\Alice Smith'")[0] == (
+            "'[redacted-path]'"
+        )
+        assert redaction_mod.redact_local_paths("'C:/Users/Alice Smith'")[0] == (
+            "'[redacted-path]'"
+        )
+
+    def test_quoted_posix_profile_root_with_a_spaced_login(self) -> None:
+        red = redaction_mod.redact_local_paths("home is '/Users/Alice Smith'")[0]
+        assert red == "home is '[redacted-path]'"
+        assert "Smith" not in red
+        red = redaction_mod.redact_local_paths('home is "/Users/Alice Smith"')[0]
+        assert red == 'home is "[redacted-path]"'
+
+    def test_quoted_profile_root_inside_a_json_field(self) -> None:
+        red = redaction_mod.redact_local_paths('{"home": "C:\\\\Users\\\\Alice Smith", "ok": 1}')[0]
+        assert red == '{"home": "[redacted-path]", "ok": 1}'
+
+    def test_prose_sharing_the_quotes_with_a_path_is_redacted_with_it(self) -> None:
+        # A quote opening on a path redacts whole; prose inside the quotes is the
+        # accepted, disclosed over-redaction, recoverable from the intact source.
+        assert redaction_mod.redact_local_paths('"C:/tmp/x is unavailable; retry later"')[0] == (
+            '"[redacted-path]"'
+        )
+        assert redaction_mod.redact_local_paths('"C:\\temp\\x is unavailable; retry later"')[0] == (
+            '"[redacted-path]"'
+        )
+        posix = redaction_mod.redact_local_paths("'/home/alice/x is unavailable; retry later'")[0]
+        assert posix == "'[redacted-path]'"
+
+    def test_prose_outside_the_quotes_survives(self) -> None:
+        red = redaction_mod.redact_local_paths('path "C:/Users/Alice Smith" is unavailable')[0]
+        assert red == 'path "[redacted-path]" is unavailable'
+
+    def test_a_url_sharing_the_quotes_with_a_path_is_redacted_with_it(self) -> None:
+        text = '"C:/Users/Alice Smith/x https://example.com/a/b"'
+        assert redaction_mod.redact_local_paths(text)[0] == '"[redacted-path]"'
+
+    def test_a_url_quoted_on_its_own_after_a_quoted_path_is_left_alone(self) -> None:
+        text = '"C:/Users/Alice Smith/x" "https://example.com/a/b"'
+        assert redaction_mod.redact_local_paths(text)[0] == (
+            '"[redacted-path]" "https://example.com/a/b"'
+        )
+
+    def test_a_quoted_spaced_filename_redacts_whole(self) -> None:
+        red = redaction_mod.redact_local_paths('"C:\\Users\\Alice Smith\\report final.docx"')[0]
+        assert red == '"[redacted-path]"'
+        assert "Alice" not in red and "Smith" not in red
+
+    def test_a_quoted_posix_path_takes_spaced_components_too(self) -> None:
+        assert redaction_mod.redact_local_paths("'/home/alice/x and/or'")[0] == "'[redacted-path]'"
+        assert redaction_mod.redact_local_paths("'/home/alice/x and/or y'")[0] == (
+            "'[redacted-path]'"
+        )
+
+
+class TestUnquotedPosixProfilesWithSpaces:
+    def test_terminal_profile_root_redacts_whole(self) -> None:
+        assert redaction_mod.redact_local_paths("/Users/Alice Smith")[0] == "[redacted-path]"
+        assert redaction_mod.redact_local_paths("/home/Alice Smith")[0] == "[redacted-path]"
+
+    def test_nested_profile_path_redacts_whole(self) -> None:
+        text = "/Users/Alice Smith/Library/Application Support/x"
+        assert redaction_mod.redact_local_paths(text)[0] == "[redacted-path]"
+
+    def test_profile_root_preserves_a_trailing_url(self) -> None:
+        text = "/Users/Alice Smith https://example.com/a/b"
+        assert redaction_mod.redact_local_paths(text)[0] == (
+            "[redacted-path] https://example.com/a/b"
+        )
+
+
+class TestUnquotedWindowsPathsWithSpaces:
+    """An unquoted Windows path with spaces redacts whole through directory
+    components while prose after a completed nested path survives."""
+
+    def test_program_files_style_path_redacts_whole(self) -> None:
+        red, notes = redaction_mod.redact_local_paths("C:\\Program Files\\x")
+        assert red == "[redacted-path]"
+        assert notes
+
+    def test_spaced_login_and_nested_spaced_directories_redact_whole(self) -> None:
+        red = redaction_mod.redact_local_paths("C:\\Users\\Alice Smith\\My Documents\\a.txt")[0]
+        assert red == "[redacted-path]"
+
+    def test_terminal_spaced_profile_roots_redact_whole(self) -> None:
+        for path in ("C:\\Users\\Alice Smith", "C:/Users/Alice Smith"):
+            assert redaction_mod.redact_local_paths(path)[0] == "[redacted-path]"
+
+    def test_terminal_profile_root_stops_before_a_trailing_url(self) -> None:
+        text = "C:/Users/Alice Smith https://example.com/a/b"
+        assert redaction_mod.redact_local_paths(text)[0] == (
+            "[redacted-path] https://example.com/a/b"
+        )
+
+    def test_terminal_profile_root_redacts_ambiguous_trailing_prose(self) -> None:
+        assert redaction_mod.redact_local_paths("C:\\Users\\Alice Smith is unavailable")[0] == (
+            "[redacted-path]"
+        )
+
+    def test_prose_around_the_path_is_kept(self) -> None:
+        red = redaction_mod.redact_local_paths(
+            "opened C:\\Users\\Alice Smith\\My Documents\\a.txt today"
+        )[0]
+        assert red == "opened [redacted-path] today"
+
+    def test_the_first_word_without_a_backslash_ends_the_path(self) -> None:
+        red = redaction_mod.redact_local_paths("C:\\Users\\Alice Smith\\x is fine")[0]
+        assert red == "[redacted-path] is fine"
+
+    def test_a_later_backslash_word_does_not_reach_back_across_prose(self) -> None:
+        red = redaction_mod.redact_local_paths("C:\\temp is not\\important")[0]
+        assert red == "[redacted-path] is not\\important"
+
+    def test_a_spaced_filename_leaves_only_its_tail_after_the_last_backslash(self) -> None:
+        red = redaction_mod.redact_local_paths("C:\\Users\\Alice Smith\\report final.docx")[0]
+        assert red == "[redacted-path] final.docx"
+        assert "Alice" not in red and "Smith" not in red
+
+    def test_a_newline_still_ends_an_unquoted_path(self) -> None:
+        red = redaction_mod.redact_local_paths("C:\\Users\\Alice\r\n Smith\\x")[0]
+        assert red == "[redacted-path]\r\n Smith\\x"
+
+    def test_a_pipe_or_angle_bracket_still_ends_an_unquoted_path(self) -> None:
+        assert redaction_mod.redact_local_paths("C:\\Users\\Alice Smith\\x|more")[0] == (
+            "[redacted-path]|more"
+        )
+        assert redaction_mod.redact_local_paths("C:\\Users\\Alice Smith\\x<more")[0] == (
+            "[redacted-path]<more"
+        )
