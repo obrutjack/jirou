@@ -2648,6 +2648,43 @@ def _posix_process_parent_map() -> dict[int, int]:
     return parent_map
 
 
+def linux_process_descendants(pid: int, *, proc_root: Path | None = None) -> list[int] | None:
+    """Return *pid*'s descendants from one Linux procfs snapshot.
+
+    ``None`` means procfs could not be enumerated. Vanished process rows are
+    ignored because processes may exit during the snapshot. This helper never
+    spawns ``ps``; callers that already permit a subprocess use
+    :func:`process_descendants` for the cross-platform path.
+    """
+    if not IS_LINUX or type(pid) is not int or pid <= 1:
+        return None
+    root = proc_root if proc_root is not None else Path("/proc")
+    try:
+        processes = list(root.iterdir())
+    except OSError:
+        return None
+    parent_map: dict[int, int] = {}
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            lines = (process / "status").read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            return None
+        except OSError:
+            continue
+        for line in lines:
+            if not line.startswith("PPid:"):
+                continue
+            value = line.partition(":")[2].strip()
+            if value.isdigit():
+                parent_map[int(process.name)] = int(value)
+            break
+    return _descendants_from_parent_map(pid, parent_map)
+
+
 def process_descendants(pid: int) -> list[int]:
     """Return *pid*'s descendants, breadth-first, from a single OS snapshot.
 
@@ -3573,37 +3610,48 @@ def loopback_owner_pids(listeners: list[PortListener]) -> list[int]:
     return list(dict.fromkeys(e.pid for e in covering))
 
 
-def find_port_listeners(port: int) -> list[PortListener]:
-    """Return (pid, local address) for each LISTEN socket on TCP *port*.
+def probe_port_listeners(
+    port: int, *, process_pid: int | None = None
+) -> tuple[list[PortListener], bool]:
+    """Return LISTEN sockets on *port* and whether the lookup completed.
 
-    Best-effort, deduped on (pid, address, family), never raises. POSIX asks
-    ``lsof -nP -iTCP:<port> -sTCP:LISTEN -Fptn`` (field output per socket:
-    ``p<pid>``, ``t<IPv4|IPv6>``, ``n<addr>:<port>``); Windows parses
-    ``netstat -ano`` (no lsof; netstat ships in-box), matching rows whose
-    local address ends in ``:<port>`` and whose state is LISTENING. Returns
-    ``[]`` on any failure (callers treat "no listener found" as "nothing to
-    stop"; use listening_pid_tool_available() to tell a genuine empty result
-    apart from the tool being absent).
+    POSIX asks ``lsof -nP -iTCP:<port> -sTCP:LISTEN -Fptn``. When
+    *process_pid* is supplied it adds ``-a -p <pid>`` so lsof inspects only that
+    process. Exit 1 with no output is lsof's ordinary completed "no matches"
+    answer. A timeout, execution error, unavailable binary, or any other nonzero
+    exit is not a completed lookup. Windows parses ``netstat -ano`` and requires
+    a zero exit; it has no PID-scoped command mode.
+
+    The status bit is for security-sensitive callers that must distinguish a
+    completed empty answer from an operational failure. Ordinary callers should
+    use :func:`find_port_listeners`, which preserves the existing best-effort
+    ``[]``-on-any-failure contract.
     """
     if IS_POSIX:
         lsof_bin = trusted_system_bin("lsof")
         if lsof_bin is None:
-            return []
+            return [], False
         try:
+            argv = [lsof_bin, "-nP"]
+            if process_pid is not None:
+                argv.extend(["-a", "-p", str(process_pid)])
+            argv.extend([f"-iTCP:{port}", "-sTCP:LISTEN", "-Fptn"])
             out = subprocess.check_output(
                 # -n/-P keep addresses and ports numeric so the field parse
                 # below never sees a resolved host or service name; the t
                 # (type) field carries the family, without which the two
                 # wildcard binds are indistinguishable (both print ``*``).
-                [lsof_bin, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fptn"],
+                argv,
                 text=True,
                 stderr=subprocess.DEVNULL,
                 timeout=_LSOF_TIMEOUT_SECS,
             )
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode == 1 and not exc.output:
+                return [], True
+            return [], False
         except (FileNotFoundError, subprocess.SubprocessError, OSError):
-            # CalledProcessError included: lsof exits non-zero when nothing
-            # matches the filter, which is the ordinary "port is free" answer.
-            return []
+            return [], False
         suffix = f":{port}"
         listeners: list[PortListener] = []
         seen: set[PortListener] = set()
@@ -3625,7 +3673,7 @@ def find_port_listeners(port: int) -> list[PortListener]:
                 if entry not in seen:
                     seen.add(entry)
                     listeners.append(entry)
-        return listeners
+        return listeners, True
     # Windows: netstat -ano. Lines look like:
     #   TCP    127.0.0.1:7777         0.0.0.0:0    LISTENING    17152   (IPv4)
     #   TCP    [::1]:7777             [::]:0       LISTENING    17152   (IPv6)
@@ -3638,7 +3686,7 @@ def find_port_listeners(port: int) -> list[PortListener]:
     # port suffix match already handles both families uniformly.
     netstat_bin = trusted_system_bin("netstat")
     if netstat_bin is None:
-        return []
+        return [], False
     try:
         out = subprocess.check_output(
             [netstat_bin, "-ano"],
@@ -3655,7 +3703,7 @@ def find_port_listeners(port: int) -> list[PortListener]:
             creationflags=_SUBPROCESS_NO_WINDOW,
         )
     except (FileNotFoundError, subprocess.SubprocessError, OSError, ValueError):
-        return []
+        return [], False
     suffix = f":{port}"
     listeners = []
     seen = set()
@@ -3699,6 +3747,103 @@ def find_port_listeners(port: int) -> list[PortListener]:
             if entry not in seen:
                 seen.add(entry)
                 listeners.append(entry)
+    return listeners, True
+
+
+def _linux_loopback_listener_inodes(port: int, proc_root: Path) -> set[str] | None:
+    """LISTEN socket inodes on *port* that can answer IPv4 loopback.
+
+    ``/proc/net/tcp`` stores IPv4 addresses little-endian. ``tcp6`` stores each
+    32-bit word little-endian. The browser child is asked to bind 127.0.0.1, but
+    wildcard and IPv4-mapped wildcard-compatible rows are included because a
+    successful loopback health probe can reach them too.
+    """
+    v4_addresses = {"00000000", "0100007F"}
+    v6_addresses = {
+        "0" * 32,
+        "0000000000000000FFFF00000100007F",
+    }
+    inodes: set[str] = set()
+    completed = False
+    for name, accepted_addresses in (("tcp", v4_addresses), ("tcp6", v6_addresses)):
+        try:
+            rows = (proc_root / "net" / name).read_text(encoding="ascii", errors="replace")
+        except OSError:
+            continue
+        completed = True
+        for row in rows.splitlines()[1:]:
+            fields = row.split()
+            if len(fields) <= 9 or fields[3].upper() != "0A":
+                continue
+            try:
+                address, port_hex = fields[1].rsplit(":", 1)
+                bound_port = int(port_hex, 16)
+            except (ValueError, IndexError):
+                continue
+            if bound_port == port and address.upper() in accepted_addresses:
+                inode = fields[9]
+                if inode.isdigit() and int(inode) > 0:
+                    inodes.add(inode)
+    return inodes if completed else None
+
+
+def process_owns_loopback_listener(
+    pid: int, port: int, *, proc_root: Path | None = None
+) -> bool | None:
+    """Whether *pid* owns a LISTEN socket that can answer 127.0.0.1:*port*.
+
+    ``True`` and ``False`` are completed per-process observations. ``None``
+    means this host cannot make the observation, so callers may use a separate
+    child-specific proof without mistaking probe failure for non-ownership.
+
+    Linux compares socket inodes from ``/proc/net/tcp{,6}`` with symlink targets
+    under ``/proc/<pid>/fd``. Other POSIX hosts run the existing listener parser
+    with lsof scoped by ``-a -p <pid>``. Windows returns ``None`` because netstat
+    cannot make a per-process query independent of the global lookup.
+    """
+    if type(pid) is not int or pid <= 0 or type(port) is not int or not 1 <= port <= 65535:
+        return None
+    if IS_LINUX:
+        root = proc_root if proc_root is not None else Path("/proc")
+        listener_inodes = _linux_loopback_listener_inodes(port, root)
+        if listener_inodes is None:
+            return None
+        if not listener_inodes:
+            return False
+        try:
+            descriptors = list((root / str(pid) / "fd").iterdir())
+        except OSError:
+            return None
+        readable = 0
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            readable += 1
+            if target.startswith("socket:[") and target.endswith("]"):
+                if target[8:-1] in listener_inodes:
+                    return True
+        if descriptors and readable == 0:
+            return None
+        return False
+
+    if not IS_POSIX:
+        return None
+    listeners, completed = probe_port_listeners(port, process_pid=pid)
+    if not completed:
+        return None
+    return pid in loopback_owner_pids(listeners)
+
+
+def find_port_listeners(port: int) -> list[PortListener]:
+    """Return LISTEN sockets on *port*, or ``[]`` on any lookup failure.
+
+    Best-effort, deduped on ``(pid, address, family)``, and never raises. Use
+    :func:`probe_port_listeners` when a caller must distinguish a completed
+    empty lookup from an operational failure.
+    """
+    listeners, _completed = probe_port_listeners(port)
     return listeners
 
 

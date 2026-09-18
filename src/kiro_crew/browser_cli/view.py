@@ -34,13 +34,17 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import logging
+import os
+import re
 import socket
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any, BinaryIO, Callable
+from urllib.parse import urlsplit
 
 from kiro_crew import platform_compat
 from kiro_crew.browser_cli.install import cli_command, cli_env, cli_path
@@ -58,6 +62,17 @@ _POLL_INTERVAL_S = 0.25
 _HEALTH_TIMEOUT_S = 2.0
 _TERMINATE_GRACE_S = 5.0
 
+# The child proof is expected in its first few lines. Bound every dimension so
+# a malformed or chatty stdout stream cannot keep a daemon reader alive forever
+# or grow its pending line without limit. Hosts with working PID attribution do
+# not depend on this fallback; an exhausted budget fails closed elsewhere.
+_BINDING_PROOF_TIMEOUT_S = _STARTUP_TIMEOUT_S
+_BINDING_PROOF_MAX_LINES = 256
+_BINDING_PROOF_MAX_BYTES = 64 * 1024
+_BINDING_PROOF_READ_SIZE = 4096
+_BINDING_PROOF_POLL_S = 0.01
+_BINDING_URL_RE = re.compile(r"https?://(?:\[[^\]\s]+\]|[^\s/:]+):\d+(?:/[^\s]*)?", re.IGNORECASE)
+
 # Concurrent connections the pinned-port relay will carry. The panel needs a
 # handful (page, assets, one screencast/input WebSocket per session view);
 # 32 leaves generous headroom while bounding the threads and sockets a local
@@ -72,6 +87,33 @@ class ShowInfo:
 
     url: str
     port: int
+
+
+@dataclass
+class _BindingProof:
+    """Fresh child binding reports, each valid for exactly one ownership check."""
+
+    port: int
+    reported: threading.Event
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(self) -> None:
+        """Publish one report token from the child-specific stdout pipe."""
+        with self._lock:
+            self.reported.set()
+
+    def consume(self) -> bool:
+        """Consume the current report once; stale checks cannot reuse it."""
+        with self._lock:
+            if not self.reported.is_set():
+                return False
+            self.reported.clear()
+            return True
+
+    def invalidate(self) -> None:
+        """Drop any unconsumed report after a reader limit or stream failure."""
+        with self._lock:
+            self.reported.clear()
 
 
 _lock = threading.Lock()
@@ -99,9 +141,10 @@ def _free_port() -> int:
     The window cannot be closed here. Closing it would mean handing the child a
     socket we already hold, and ``playwright-cli show`` takes a port NUMBER, not
     an inherited descriptor — so there is no bind-before-release to perform. What
-    contains it is :func:`_port_owner`: the readiness gate proves the responder
-    belongs to the process tree we spawned before adopting it, so losing the race
-    is reported as a failed start instead of adopting the winner.
+    contains it is the readiness gate: it requires either PID attribution to the
+    process tree we spawned or a recognized post-bind loopback URL reported on
+    that child's private stdout pipe. Losing the race is therefore reported as a
+    failed start instead of adopting the winner.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((LOOPBACK_HOST, 0))
@@ -320,12 +363,37 @@ def _healthy(port: int) -> bool:
 
 #: Proven: a process in the tree we spawned holds the port.
 _OWNER_CHILD = "child"
-#: Treated as foreign. Either a lookup that ran and could not attribute the
-#: listener to us, or a proven third party -- both mean "not demonstrably ours".
+#: Treated as foreign. Either a functional lookup could not attribute the
+#: listener to us, or it proved a third party owns the port.
 _OWNER_FOREIGN = "foreign"
-#: The port->PID lookup tool is not installed on this host. Deliberately still
-#: adopted; see :func:`_port_owner` for why this one branch stays fail-open.
+#: The global port-to-PID lookup is absent or blind. Adoption still requires a
+#: per-process ownership result or, when none is available, a startup report.
 _OWNER_UNPROVEN = "unproven"
+
+
+def _listener_lookup_functional() -> bool | None:
+    """Whether the port-to-PID lookup can attribute a known local listener.
+
+    A resolvable ``lsof`` or ``netstat`` can still be unusable from the current
+    process namespace. Bind a real loopback control listener owned by this
+    process and ask the same platform helper used for the target port. ``None``
+    means the control listener could not be created or its lookup did not
+    complete. Neither is evidence that the tool is blind, so the caller stays
+    fail-closed.
+    """
+    listener = _claim_listener(0)
+    if listener is None:
+        return None
+    try:
+        control_port = int(listener.getsockname()[1])
+        listeners, completed = platform_compat.probe_port_listeners(control_port)
+        if not completed:
+            return None
+        owners = platform_compat.loopback_owner_pids(listeners)
+        return os.getpid() in owners
+    finally:
+        with contextlib.suppress(Exception):
+            listener.close()
 
 
 def _port_owner(port: int, proc: subprocess.Popen[bytes] | None) -> str:
@@ -337,24 +405,20 @@ def _port_owner(port: int, proc: subprocess.Popen[bytes] | None) -> str:
     and a bare health probe then reports the squatter as our server -- after which
     the panel frames arbitrary content with input forwarding attached.
 
-    **A lookup that RAN but cannot attribute the listener to us is FOREIGN, not
-    undecidable.** The caller only asks after a successful ``127.0.0.1`` probe, so
-    something is listening; if a working lookup cannot show it belongs to our
-    tree, "not ours" is the honest reading. That covers a squatter owned by
-    another user (invisible to our ``lsof``) and a lookup that timed out under
-    load. The cost is a refused start on a loaded host, which is recoverable and
-    reported; adopting an unverified responder is not.
+    A lookup that can attribute a known local listener but cannot attribute the
+    target is FOREIGN, not undecidable. The caller only asks after a successful
+    ``127.0.0.1`` probe, so something is listening. If a functional lookup cannot
+    show that it belongs to our tree, "not ours" is the safe reading. This covers
+    a squatter owned by another user and invisible on the target port.
 
-    **The one fail-open branch is the tool being absent**, which is a static
-    property of the host rather than a per-start event. Refusing there would take
-    the panel away from every machine without ``lsof`` -- a certain, permanent
-    regression of a working feature, traded against a race whose winner must
-    already be a local process on a loopback-only dev surface. It is also not
-    attacker-controllable in any threat model that matters: removing
-    ``/usr/bin/lsof`` needs the kind of access that makes this panel the least of
-    the problems. The pod health probe draws the same line for the same reason,
-    and the startup gate logs when it lands here so the operator knows the check
-    did not run.
+    A missing lookup tool or a completed control lookup that cannot attribute a
+    listener this process just bound yields UNPROVEN. Both establish a host
+    capability failure rather than evidence about this start. UNPROVEN is not an
+    adoption decision: the caller must obtain a separate positive proof from the
+    child. The self-test runs only after the target lookup returns empty. A
+    functional tool that sees the control but not the target still refuses the
+    target as foreign, as does a control lookup that times out, cannot execute, or
+    otherwise does not complete.
     """
     if proc is None:
         return _OWNER_FOREIGN
@@ -362,9 +426,8 @@ def _port_owner(port: int, proc: subprocess.Popen[bytes] | None) -> str:
         return _OWNER_UNPROVEN
     listeners = platform_compat.find_port_listeners(port)
     if not listeners:
-        # The port answered a moment ago, so someone IS listening. A working
-        # lookup that sees nothing means the socket is not visible to us, which
-        # is not evidence of ownership.
+        if _listener_lookup_functional() is False:
+            return _OWNER_UNPROVEN
         return _OWNER_FOREIGN
     owners = platform_compat.loopback_owner_pids(listeners)
     if not owners:
@@ -378,24 +441,239 @@ def _port_owner(port: int, proc: subprocess.Popen[bytes] | None) -> str:
     return _OWNER_FOREIGN
 
 
-def _recorded_is_live() -> bool:
-    """Whether the recorded child is alive, answering, AND still owns its port.
+def _binding_reported_on_line(line: bytes, port: int) -> bool:
+    """Whether trusted child stdout reports the loopback address we assigned.
 
-    One predicate for both the reuse gate in :func:`ensure_running` and
-    :func:`status`, so the two cannot disagree about what "running" means. A
-    divergence would matter: ``status`` is what hands the panel its URL, so a
-    reachability-only ``status`` would report a squatter as running and point the
-    panel at it even while ``ensure_running`` refused to adopt the same server.
+    The wording around Playwright's listener URL has changed between CLI
+    releases. Require a listener marker, then parse each URL by scheme, host,
+    and port. A path, prefix, or punctuation change cannot break the proof, but
+    an unrelated URL, host, protocol, or port cannot satisfy it.
+    """
+    text = line.decode("utf-8", errors="replace")
+    if re.search(r"\blisten(?:ing)?\b", text, re.IGNORECASE) is None:
+        return False
+    for token in _BINDING_URL_RE.findall(text):
+        try:
+            parsed = urlsplit(token)
+            parsed_port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.casefold() == "http"
+            and parsed.hostname == LOOPBACK_HOST
+            and parsed_port == port
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            return True
+    return False
+
+
+def _binding_chunk_reader(stream: BinaryIO) -> Callable[[int], bytes] | None:
+    """Return a nonblocking chunk reader, or ``None`` when none is safe.
+
+    ``Popen(stdout=PIPE)`` supplies a real descriptor. ``BytesIO`` is supported
+    as the finite test seam. An unconstrained mock is deliberately rejected:
+    converting its synthetic ``fileno`` to an int can target this process's own
+    stdout, and its synthetic reads never reach EOF.
+    """
+    if isinstance(stream, io.BytesIO):
+        return stream.read
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+    if type(fd) is not int or fd < 0:
+        return None
+    try:
+        os.set_blocking(fd, False)
+    except (OSError, ValueError):
+        return None
+    return lambda size: os.read(fd, size)
+
+
+def _discard_child_output(read_chunk: Callable[[int], bytes]) -> None:
+    """Drain child stdout until EOF after it stops carrying proof data."""
+    while True:
+        try:
+            chunk = read_chunk(_BINDING_PROOF_READ_SIZE)
+        except BlockingIOError:
+            time.sleep(_BINDING_PROOF_POLL_S)
+            continue
+        except (OSError, ValueError):
+            return
+        if not isinstance(chunk, bytes) or not chunk:
+            return
+
+
+def _drain_child_output(stream: BinaryIO, port: int, proof: _BindingProof) -> None:
+    """Scan a bounded prefix for proof, then drain stdout until EOF.
+
+    The real pipe is nonblocking so the wall-clock deadline bounds a silent
+    child. Lines and bytes bound chatty or unterminated output. Exhausting any
+    proof limit invalidates an unconsumed report and switches the same daemon
+    thread to discard mode, so later child output cannot fill the pipe.
+    """
+    read_chunk = _binding_chunk_reader(stream)
+    if read_chunk is None:
+        proof.invalidate()
+        return
+    deadline = time.monotonic() + _BINDING_PROOF_TIMEOUT_S
+    pending = bytearray()
+    lines = 0
+    total = 0
+    matched = False
+    drift_logged = False
+
+    def _log_drift() -> None:
+        nonlocal drift_logged
+        if total > 0 and not matched and not drift_logged:
+            logger.warning(
+                "playwright-cli show stdout did not contain a recognized listener "
+                "address for port %d; the upstream banner may have changed",
+                port,
+            )
+            drift_logged = True
+
+    def _discard_after_proof_window() -> None:
+        proof.invalidate()
+        _log_drift()
+        _discard_child_output(read_chunk)
+
+    try:
+        while True:
+            now = time.monotonic()
+            if (
+                now >= deadline
+                or lines >= _BINDING_PROOF_MAX_LINES
+                or total >= _BINDING_PROOF_MAX_BYTES
+            ):
+                _discard_after_proof_window()
+                return
+            remaining = _BINDING_PROOF_MAX_BYTES - total
+            try:
+                chunk = read_chunk(min(_BINDING_PROOF_READ_SIZE, remaining + 1))
+            except BlockingIOError:
+                delay = min(_BINDING_PROOF_POLL_S, max(0.0, deadline - time.monotonic()))
+                if delay:
+                    time.sleep(delay)
+                continue
+            if not isinstance(chunk, bytes):
+                proof.invalidate()
+                return
+            if not chunk:
+                if pending:
+                    lines += 1
+                    if lines > _BINDING_PROOF_MAX_LINES:
+                        _discard_after_proof_window()
+                        return
+                    if _binding_reported_on_line(bytes(pending), port):
+                        matched = True
+                        proof.record()
+                return
+            total += len(chunk)
+            if total > _BINDING_PROOF_MAX_BYTES:
+                _discard_after_proof_window()
+                return
+            pending.extend(chunk)
+            while True:
+                newline = pending.find(b"\n")
+                if newline < 0:
+                    break
+                line = bytes(pending[:newline])
+                del pending[: newline + 1]
+                lines += 1
+                if lines > _BINDING_PROOF_MAX_LINES:
+                    _discard_after_proof_window()
+                    return
+                if _binding_reported_on_line(line, port):
+                    matched = True
+                    proof.record()
+    except (OSError, ValueError):
+        # Reaping closes the pipe. A report not yet consumed must fail closed.
+        proof.invalidate()
+    finally:
+        _log_drift()
+
+
+def _child_reported_binding(proc: subprocess.Popen[bytes], port: int) -> bool:
+    """Consume one fresh recognized-address report from this child, if available."""
+    proof = getattr(proc, "_kirocrew_browser_view_binding", None)
+    return isinstance(proof, _BindingProof) and proof.port == port and proof.consume()
+
+
+def _verify_child_listener(
+    proc: subprocess.Popen[bytes], port: int, *, allow_report: bool
+) -> tuple[bool | None, bool]:
+    """Verify this child owns *port* and say whether stdout was the proof.
+
+    Global attribution remains the strongest result. On a blind host, the child
+    and each descendant PID are checked independently. The one-shot stdout
+    report is accepted only during startup and only when no per-process probe
+    can run. Reports are consumed on every path so a PID-proven start cannot
+    leave a stale token for a later listener.
+    """
+    owner = _port_owner(port, proc)
+    fresh_report = _child_reported_binding(proc, port)
+    if owner == _OWNER_CHILD:
+        return True, False
+    if owner == _OWNER_FOREIGN:
+        return False, False
+    if platform_compat.IS_LINUX:
+        descendants = platform_compat.linux_process_descendants(proc.pid)
+        inconclusive = descendants is None
+        descendants = descendants or []
+    else:
+        descendants = platform_compat.process_descendants(proc.pid)
+        inconclusive = False
+    candidates = list(dict.fromkeys([proc.pid, *descendants]))
+    for pid in candidates:
+        per_process = platform_compat.process_owns_loopback_listener(pid, port)
+        if per_process is True:
+            return True, False
+        if per_process is None:
+            inconclusive = True
+    if not inconclusive:
+        return False, False
+    if allow_report and fresh_report:
+        return True, True
+    return None, False
+
+
+def _recorded_state() -> bool | None:
+    """Return True for reusable, False for failed, or None for inconclusive.
+
+    Reuse and status share this decision so they cannot disagree about URL
+    publication. A failed health probe or a completed ownership mismatch is a
+    definitive negative. Missing ownership evidence is inconclusive: keep the
+    live child and withhold its URL until ownership can be proved.
 
     Callers hold :data:`_lock`.
     """
-    return (
-        _alive(_proc)
-        and _info is not None
-        and _healthy(_info.port)
-        and _child_port is not None
-        and _port_owner(_child_port, _proc) != _OWNER_FOREIGN
-    )
+    global _last_reason
+    if _proc is None or not _alive(_proc) or _info is None or _child_port is None:
+        return False
+    if not _healthy(_info.port):
+        reason = f"live browser view child stopped answering on port {_child_port}"
+        if _last_reason != reason:
+            logger.warning("%s", reason)
+        _last_reason = reason
+        return False
+    verified, _via_report = _verify_child_listener(_proc, _child_port, allow_report=False)
+    if verified is True:
+        _last_reason = None
+        return True
+    if verified is False:
+        reason = f"live browser view child no longer owns port {_child_port}"
+        if _last_reason != reason:
+            logger.warning("%s", reason)
+        _last_reason = reason
+        return False
+    reason = f"cannot re-verify live browser view child ownership of port {_child_port}"
+    if _last_reason != reason:
+        logger.warning("%s; keeping the child but withholding its URL", reason)
+    _last_reason = reason
+    return None
 
 
 def _show_argv(command: list[str], port: int) -> list[str]:
@@ -433,10 +711,12 @@ def _reap(proc: subprocess.Popen[bytes]) -> None:
 def _spawn(command: list[str], port: int) -> subprocess.Popen[bytes] | None:
     """Start the dashboard server, or ``None`` if it cannot be spawned.
 
-    Output goes to ``DEVNULL`` on purpose. An unread ``PIPE`` fills its buffer
-    and blocks the server permanently, and the readiness signal is the health
-    probe rather than a parsed log line, so the output has no reader to justify
-    the risk.
+    Stdout is a child-specific proof channel. Playwright prints its exact
+    listening address only after its HTTP server binds, so a daemon reader scans
+    a finite nonblocking prefix for that line. Line, byte, and time limits bound
+    the proof scan; after any limit, the daemon keeps draining and discarding
+    stdout so a chatty long-lived child cannot fill its pipe. Stderr stays on
+    ``DEVNULL`` because no readiness or ownership signal is defined there.
 
     ``start_new_session`` puts the child in its own process group on POSIX so
     the whole tree can be signalled at stop time without touching the gateway's
@@ -450,10 +730,10 @@ def _spawn(command: list[str], port: int) -> subprocess.Popen[bytes] | None:
     env = cli_env()
     env.update(ui_socket_env(env))
     try:
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             _show_argv(command, port),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             start_new_session=platform_compat.IS_POSIX,
             env=env,
@@ -462,14 +742,27 @@ def _spawn(command: list[str], port: int) -> subprocess.Popen[bytes] | None:
         logger.warning("could not start playwright-cli show: %s", exc)
         return None
 
+    stream = getattr(proc, "stdout", None)
+    if stream is not None:
+        proof = _BindingProof(port=port, reported=threading.Event())
+        setattr(proc, "_kirocrew_browser_view_binding", proof)
+        threading.Thread(
+            target=_drain_child_output,
+            args=(stream, port, proof),
+            name="browser-view-listener-proof",
+            daemon=True,
+        ).start()
+    return proc
+
 
 def ensure_running(port: int | None = None) -> ShowInfo | None:
     """Return the running dashboard, starting it if needed.
 
-    Idempotent: a process that is alive and answering is reused, so repeated
-    calls from a panel mount do not spawn a second server. A recorded process
-    that has died or stopped answering is reaped first, because leaving it
-    would make every later call reuse a corpse.
+    Idempotent: a process that is alive, answering, and still owns its listener
+    is reused, so repeated calls from a panel mount do not spawn a second server.
+    A dead recorded process or one with a definitive health or ownership failure
+    is reaped before replacement. A live recorded process with inconclusive
+    ownership stays running in a degraded state with no published URL.
 
     *port* pins the port the dashboard is reachable on; ``None`` (or ``0``)
     keeps the OS-assigned ephemeral default. A pin is never handed to the
@@ -489,8 +782,11 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
         # Ownership is re-proved on reuse, not just at startup. A child that is
         # alive but not listening leaves its port free for a squatter, and
         # without this the next call would hand that squatter back as the panel.
-        if _recorded_is_live():
+        recorded_state = _recorded_state()
+        if recorded_state is True:
             return _info
+        if recorded_state is None:
+            return None
         if _proc is not None:
             _reap(_proc)
             _proc = None
@@ -532,6 +828,7 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
 
         public_port = port if port else child_port
         deadline = time.monotonic() + _STARTUP_TIMEOUT_S
+        saw_unproven_responder = False
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 logger.warning(
@@ -547,8 +844,8 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
                 # Reachability is not identity. Prove the responder is ours
                 # before adopting it; a squatter that won _free_port's window
                 # answers this probe exactly as our child would.
-                owner = _port_owner(child_port, proc)
-                if owner == _OWNER_FOREIGN:
+                verified, via_report = _verify_child_listener(proc, child_port, allow_report=True)
+                if verified is False:
                     logger.warning(
                         "another local process holds port %d — refusing to adopt "
                         "it as the browser view",
@@ -562,30 +859,45 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
                     )
                     _reap(proc)
                     return None
-                if owner == _OWNER_UNPROVEN:
-                    # Said once per start, not per poll: the operator should know
-                    # the ownership check did not run, since without it this
-                    # adoption rests on reachability alone.
-                    logger.warning(
-                        "cannot verify which process holds port %d (%s is not "
-                        "installed); adopting the browser view on reachability "
-                        "alone",
-                        child_port,
-                        platform_compat.listening_pid_tool(),
-                    )
-                _proc = proc
-                _relay = relay
-                _child_port = child_port
-                _info = ShowInfo(url=f"http://{LOOPBACK_HOST}:{public_port}", port=public_port)
-                return _info
+                if verified is None:
+                    # The HTTP responder may be a squatter. Keep polling only so
+                    # the trusted child's post-bind stdout line can arrive.
+                    saw_unproven_responder = True
+                else:
+                    if via_report:
+                        logger.warning(
+                            "cannot verify which process holds port %d (%s is "
+                            "unavailable or cannot attribute a known local listener); "
+                            "adopting only because the spawned child reported that "
+                            "it bound a recognized loopback listener address",
+                            child_port,
+                            platform_compat.listening_pid_tool(),
+                        )
+                    _proc = proc
+                    _relay = relay
+                    _child_port = child_port
+                    _info = ShowInfo(url=f"http://{LOOPBACK_HOST}:{public_port}", port=public_port)
+                    return _info
             time.sleep(_POLL_INTERVAL_S)
 
-        logger.warning(
-            "playwright-cli show did not answer on port %d within the budget", child_port
-        )
+        if saw_unproven_responder:
+            logger.warning(
+                "cannot verify which process holds port %d and the spawned child "
+                "did not report that it bound the exact loopback address; refusing "
+                "to adopt the responder",
+                child_port,
+            )
+            _last_reason = f"could not prove the browser view owns port {child_port}"
+        else:
+            logger.warning(
+                "playwright-cli show did not answer on port %d within the budget",
+                child_port,
+            )
+            _last_reason = (
+                f"playwright-cli show did not answer on port {child_port} within the budget"
+            )
         if relay is not None:
             relay.close()
-        _last_reason = f"playwright-cli show did not answer on port {child_port} within the budget"
         _reap(proc)
         return None
 
@@ -633,7 +945,7 @@ def status() -> dict[str, Any]:
                 "port": None,
                 "reason": "playwright-cli is not installed",
             }
-        if _recorded_is_live() and _info is not None:
+        if _recorded_state() is True and _info is not None:
             return {
                 "status": "running",
                 "url": _info.url,

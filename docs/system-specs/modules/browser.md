@@ -432,7 +432,43 @@ child: the supervisor claims the pinned port itself with a bound listener it
 keeps holding, an atomic ownership proof that makes the deterministic,
 operator-named port race-free, and relays byte-for-byte to the child's own
 ephemeral port. The child's OS-assigned port keeps the unpinned path's
-advisory bind window (unpredictable, loopback-local); both bind loopback only. The served dashboard
+advisory bind window (unpredictable, loopback-local); both bind loopback
+only. After the child answers, the supervisor asks
+`platform_compat.find_port_listeners` who owns its port. A PID in the spawned
+process tree is positive ownership proof. When that global lookup is absent or
+cannot attribute a known listener, the supervisor checks the spawned child and
+its current descendants by PID. Linux builds the descendant set from
+`/proc/*/status`, then compares the port's LISTEN socket inode from
+`/proc/net/tcp{,6}` with each `/proc/<pid>/fd`; this path spawns no helper.
+Other POSIX hosts run `lsof` scoped with `-p <pid>`. Windows has no independent
+per-process query and therefore uses the child-report fallback described below.
+A completed check for every PID that finds no owner is a definitive mismatch even
+if another process answers the health probe.
+
+Only a host with no usable per-process check falls back to the trusted child's
+stdout during startup. The parser extracts the scheme, host, and port from a
+listener line, so harmless banner prefixes, separators, and URL paths may
+change without disabling the panel. It still requires HTTP, `127.0.0.1`, and
+the assigned port. Playwright writes the line only after its server binds, and
+a process racing for the TCP port cannot write to the child's pipe. A reader
+that consumes stdout without finding a recognized listener URL logs a distinct
+banner-drift warning. Line count, byte count, and time bound only the proof
+window. When that window closes, the daemon keeps draining and discarding stdout
+until EOF so a chatty long-lived child cannot fill its pipe and block.
+
+Reuse and status checks require the recorded child to remain alive and to own
+the listener. Blind hosts re-run per-process checks against the child and its
+current descendants. When every available per-process probe is inconclusive, a
+report-only live child becomes degraded, logs a warning, and publishes no URL;
+the startup line cannot prove current ownership. A failed control-channel health
+check or a completed ownership mismatch is definitive: `ensure_running` reaps
+the live child and follows the existing respawn path. Reachability alone never
+permits adoption. A functional global lookup that attributes the target
+elsewhere, a completed process-tree mismatch, and a child that never reports a
+recognized address all fail closed without publishing the port URL. The
+dashboard control socket cannot replace these checks with a nonce challenge
+because its reveal request carries only `sessionName` and its fixed PID response
+echoes no client-supplied field. The served dashboard
 provides the session grid with live screencast, a session detail view with tab bar
 and navigation controls, and full remote mouse and keyboard input, so a human can
 take over a session directly: this is the path for a CAPTCHA or a 2FA prompt that

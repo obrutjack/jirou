@@ -605,6 +605,17 @@ class TestFindListeningPids:
         finally:
             s.close()
 
+    @pytest.mark.skipif(not pc.IS_LINUX, reason="Linux procfs ownership probe")
+    def test_linux_per_process_probe_finds_its_real_listener(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = int(listener.getsockname()[1])
+
+            assert pc.process_owns_loopback_listener(os.getpid(), port) is True
+
 
 class TestProcessCommandLine:
     def test_self_cmdline_mentions_python(self):
@@ -1947,6 +1958,28 @@ class TestProcessDescendants:
 
         assert pc._descendants_from_parent_map(10, parent_map) == [11, 13, 12, 14]
 
+    def test_linux_descendants_walk_procfs_without_a_subprocess(self, tmp_path, monkeypatch):
+        proc_root = tmp_path / "proc"
+        for process, parent in ((10, 1), (11, 10), (12, 11), (13, 10), (99, 1)):
+            process_root = proc_root / str(process)
+            process_root.mkdir(parents=True)
+            (process_root / "status").write_text(
+                f"Name:\ttest\nPPid:\t{parent}\n",
+                encoding="utf-8",
+            )
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(
+            pc.subprocess,
+            "check_output",
+            lambda *args, **kwargs: pytest.fail("procfs discovery must not spawn ps"),
+        )
+
+        descendants = pc.linux_process_descendants(10, proc_root=proc_root)
+
+        assert descendants is not None
+        assert set(descendants) == {11, 12, 13}
+        assert descendants.index(11) < descendants.index(12)
+
     @pytest.mark.asyncio
     async def test_descendant_termination_handles_async_is_empty_on_posix(self):
         if pc.IS_WINDOWS:
@@ -3276,10 +3309,19 @@ class TestFindListeningPidsErrors:
             pc.PortListener(222, "192.168.1.5", "4"),
         ]
 
-    def test_posix_lookup_is_bounded_by_a_timeout(self, monkeypatch):
-        # A wedged lsof (stale mount, jammed process table) must degrade to
-        # "no listener found" instead of hanging every port->PID caller: the
-        # spawn carries a timeout, and its expiry folds into [].
+    def test_posix_no_match_is_a_completed_empty_probe(self, monkeypatch):
+        if not pc.IS_POSIX:
+            pytest.skip("POSIX lsof branch")
+
+        def _no_match(argv, **kwargs):
+            raise subprocess.CalledProcessError(1, argv, output="")
+
+        monkeypatch.setattr(pc.subprocess, "check_output", _no_match)
+        listeners, completed = pc.probe_port_listeners(7777)
+        assert listeners == []
+        assert completed is True
+
+    def test_posix_lookup_timeout_is_not_a_completed_probe(self, monkeypatch):
         if not pc.IS_POSIX:
             pytest.skip("POSIX lsof branch")
         captured: dict = {}
@@ -3290,8 +3332,86 @@ class TestFindListeningPidsErrors:
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
 
         monkeypatch.setattr(pc.subprocess, "check_output", _capture)
-        assert pc.find_port_listeners(7777) == []
+        listeners, completed = pc.probe_port_listeners(7777)
+        assert listeners == []
+        assert completed is False
         assert captured["kwargs"].get("timeout") == pc._LSOF_TIMEOUT_SECS
+
+    def test_linux_process_listener_probe_matches_the_child_socket_inode(
+        self, tmp_path, monkeypatch
+    ):
+        proc_root = tmp_path / "proc"
+        (proc_root / "net").mkdir(parents=True)
+        (proc_root / "4242" / "fd").mkdir(parents=True)
+        (proc_root / "4242" / "fd" / "7").touch()
+        (proc_root / "net" / "tcp").write_text(
+            "header\n"
+            "0: 0100007F:1E61 00000000:0000 0A 00000000:00000000 "
+            "00:00000000 00000000 1000 0 12345\n",
+            encoding="ascii",
+        )
+        (proc_root / "net" / "tcp6").write_text("header\n", encoding="ascii")
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc.os, "readlink", lambda path: "socket:[12345]")
+
+        assert pc.process_owns_loopback_listener(4242, 7777, proc_root=proc_root) is True
+
+    def test_linux_process_listener_probe_rejects_an_inode_the_child_does_not_hold(
+        self, tmp_path, monkeypatch
+    ):
+        proc_root = tmp_path / "proc"
+        (proc_root / "net").mkdir(parents=True)
+        (proc_root / "4242" / "fd").mkdir(parents=True)
+        (proc_root / "4242" / "fd" / "7").touch()
+        (proc_root / "net" / "tcp").write_text(
+            "header\n"
+            "0: 0100007F:1E61 00000000:0000 0A 00000000:00000000 "
+            "00:00000000 00000000 1000 0 12345\n",
+            encoding="ascii",
+        )
+        (proc_root / "net" / "tcp6").write_text("header\n", encoding="ascii")
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc.os, "readlink", lambda path: "socket:[99999]")
+
+        assert pc.process_owns_loopback_listener(4242, 7777, proc_root=proc_root) is False
+
+    def test_posix_process_listener_probe_scopes_lsof_to_the_child_pid(self, monkeypatch):
+        captured: dict = {}
+        blob = "p4242\ntIPv4\nn127.0.0.1:7777\n"
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda name: "/usr/bin/lsof")
+
+        def _capture(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return blob
+
+        monkeypatch.setattr(pc.subprocess, "check_output", _capture)
+
+        assert pc.process_owns_loopback_listener(4242, 7777) is True
+        assert captured["argv"] == [
+            "/usr/bin/lsof",
+            "-nP",
+            "-a",
+            "-p",
+            "4242",
+            "-iTCP:7777",
+            "-sTCP:LISTEN",
+            "-Fptn",
+        ]
+
+    def test_windows_process_listener_probe_reports_unavailable(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pc,
+            "probe_port_listeners",
+            lambda *args, **kwargs: pytest.fail("global netstat must not be reused"),
+        )
+
+        assert pc.process_owns_loopback_listener(4242, 7777) is None
 
     def _fake_netstat(self, blob: str):
         """Return a fake subprocess.check_output that returns *blob*."""
@@ -3300,6 +3420,19 @@ class TestFindListeningPidsErrors:
             return blob
 
         return _run
+
+    def test_windows_lookup_error_is_not_a_completed_probe(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
+
+        def _boom(*args, **kwargs):
+            raise OSError("netstat unavailable")
+
+        monkeypatch.setattr(pc.subprocess, "check_output", _boom)
+        listeners, completed = pc.probe_port_listeners(7777)
+        assert listeners == []
+        assert completed is False
 
     def test_windows_finds_ipv6_listener_via_netstat(self, monkeypatch):
         # Regression:. Windows netstat -ano prints IPv6 LISTEN rows

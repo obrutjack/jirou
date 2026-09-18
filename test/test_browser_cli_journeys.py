@@ -9,6 +9,7 @@ configuration the operator owns.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import time
@@ -965,7 +966,12 @@ class TestViewSubprocessesReceiveNodeEnv:
 
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value = MagicMock()
-            view_mod._spawn("/n/pw", 9999)
+            mock_popen.return_value.stdout = io.BytesIO(b"Listening on http://127.0.0.1:9999\n")
+            proc = view_mod._spawn(["/n/pw"], 9999)
+
+        assert proc is not None
+        proof = getattr(proc, "_kirocrew_browser_view_binding")
+        assert proof.reported.wait(timeout=1), "listener-proof reader never consumed stdout"
 
         mock_popen.assert_called_once()
         _, kwargs = mock_popen.call_args

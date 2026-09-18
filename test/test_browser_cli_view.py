@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import io
+import os
 import socket
 import threading
 import time
@@ -18,11 +20,12 @@ from kiro_crew.browser_cli import view as mod
 class FakeProc:
     """Stand-in for the supervised child; never touches a real process."""
 
-    def __init__(self, alive: bool = True, pid: int = 424242) -> None:
+    def __init__(self, alive: bool = True, pid: int = 424242, stdout: bytes = b"") -> None:
         self.pid = pid
         self._alive = alive
         self.returncode: int | None = None if alive else 1
         self.killed = False
+        self.stdout = io.BytesIO(stdout)
 
     def poll(self) -> int | None:
         return None if self._alive else self.returncode
@@ -71,6 +74,15 @@ def reset_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
     # pre-identity behaviour every existing test was written against; the tests
     # that exercise ownership opt in with `_stub_port_owner`.
     monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: False)
+    # A bare FakeProc stands for a real child that owns its listener. Tests for
+    # blind hosts override these two seams independently.
+    monkeypatch.setattr(mod, "_child_reported_binding", lambda proc, port: True, raising=False)
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        lambda pid, port: True,
+        raising=False,
+    )
     monkeypatch.setattr(
         platform_compat,
         "kill_process_tree",
@@ -107,6 +119,12 @@ def _stub_port_owner(
         ],
     )
     monkeypatch.setattr(platform_compat, "process_descendants", lambda pid: list(descendants))
+    monkeypatch.setattr(
+        platform_compat,
+        "linux_process_descendants",
+        lambda pid: list(descendants),
+        raising=False,
+    )
 
 
 def _free_port() -> int:
@@ -178,6 +196,31 @@ def test_show_argv_preserves_the_direct_node_and_javascript_prefix() -> None:
 
     assert argv[:3] == [*command, "show"]
     assert argv[argv.index("--host") + 1] == mod.LOOPBACK_HOST
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"Listening on http://127.0.0.1:45613\n",
+        b"[playwright] Listening at: http://127.0.0.1:45613/dashboard\n",
+        b"Browser view is listening on http://127.0.0.1:45613/\n",
+    ],
+)
+def test_binding_report_extracts_the_spawned_loopback_address(line: bytes) -> None:
+    assert mod._binding_reported_on_line(line, 45613)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"Listening on http://127.0.0.1:45614\n",
+        b"Listening on http://localhost:45613\n",
+        b"Listening on ftp://127.0.0.1:45613\n",
+        b"Dashboard link http://127.0.0.1:45613\n",
+    ],
+)
+def test_binding_report_rejects_the_wrong_endpoint_or_non_listener_line(line: bytes) -> None:
+    assert not mod._binding_reported_on_line(line, 45613)
 
 
 def test_health_accepts_a_302(redirecting_server: int) -> None:
@@ -583,44 +626,43 @@ def test_ensure_running_replaces_a_dead_process(monkeypatch: pytest.MonkeyPatch)
     assert len(spawns) == 2
 
 
-def test_ensure_running_respawns_when_process_stops_answering(
-    monkeypatch: pytest.MonkeyPatch, reset_state: list[int]
+@pytest.mark.parametrize("failure", ["health", "ownership"])
+def test_definitive_live_child_failure_is_reaped_and_respawned(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+    failure: str,
 ) -> None:
-    """Alive but unresponsive is still unusable, and the stale child is reaped."""
-    spawns: list[int] = []
-    probes: list[int] = []
+    children = [FakeProc(pid=4242), FakeProc(pid=4343)]
+    spawned: list[FakeProc] = []
+    ports = iter((45613, 45614))
+    failed_health_ports: set[int] = set()
+    ownership = {4242: True, 4343: True}
     monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
-    healthy = {"value": True}
-
-    def probe(port: int) -> bool:
-        probes.append(port)
-        return healthy["value"]
-
-    monkeypatch.setattr(mod, "_healthy", probe)
+    monkeypatch.setattr(mod, "_free_port", lambda: next(ports))
+    monkeypatch.setattr(mod, "_healthy", lambda port: port not in failed_health_ports)
     monkeypatch.setattr(
-        mod, "_spawn", lambda cli, port: spawns.append(port) or FakeProc(pid=len(spawns))
+        mod, "_spawn", lambda cli, port: spawned.append(children.pop(0)) or spawned[-1]
     )
-    # This test deliberately never satisfies the startup gate, so it would
-    # otherwise wait out the real 30s budget one 0.25s tick at a time. The fake
-    # clock only advances when the gate sleeps, which costs no wall time and
-    # makes the tick count exact rather than timing-dependent.
-    monkeypatch.setattr(mod, "time", _FakeClock())
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        lambda pid, port: ownership[pid],
+    )
+    _stub_port_owner(monkeypatch, listener_pids=(), tool=False)
 
-    mod.ensure_running()
-    healthy["value"] = False
-    probes.clear()
-    # Startup gate cannot pass while unhealthy, so this reports failure...
-    assert mod.ensure_running() is None
-    # ...and BOTH children were signalled rather than left holding a port: the
-    # incumbent it declined to reuse (pid 1) and the replacement that never
-    # answered (pid 2). Only checking pid 1 would leave the give-up path's reap
-    # untested, since the incumbent is reaped before the replacement is spawned.
-    assert reset_state == [1, 2]
-    # The gate polled for its whole documented budget before giving up, one probe
-    # per tick, plus the single probe of the incumbent it declined to reuse. A
-    # budget that expires before its first poll would report the same failure
-    # while proving nothing about an unhealthy child.
-    assert len(probes) == 1 + int(mod._STARTUP_TIMEOUT_S / mod._POLL_INTERVAL_S)
+    first = mod.ensure_running()
+    assert first is not None
+    if failure == "health":
+        failed_health_ports.add(first.port)
+    else:
+        ownership[4242] = False
+
+    second = mod.ensure_running()
+
+    assert second is not None
+    assert second.port == 45614
+    assert [child.pid for child in spawned] == [4242, 4343]
+    assert 4242 in reset_state
 
 
 def test_ensure_running_gives_up_when_child_exits_during_startup(
@@ -769,17 +811,129 @@ def test_port_owner_is_unproven_without_the_lookup_tool(
     assert mod._port_owner(45613, proc) == mod._OWNER_UNPROVEN
 
 
-def test_port_owner_refuses_when_a_working_lookup_sees_nothing(
+def test_blind_lookup_squatter_is_not_adopted_without_child_binding_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+) -> None:
+    """A squatter cannot receive the host-scoped browser cookie through the view URL."""
+    proc = FakeProc(pid=4242)
+    clock = _FakeClock()
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: proc)
+    monkeypatch.setattr(mod, "time", clock)
+    monkeypatch.setattr(mod, "_child_reported_binding", lambda child, port: False, raising=False)
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        lambda pid, port: None,
+        raising=False,
+    )
+    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
+    monkeypatch.setattr(platform_compat, "find_port_listeners", lambda port: [])
+    monkeypatch.setattr(
+        platform_compat,
+        "probe_port_listeners",
+        lambda port: ([], True),
+        raising=False,
+    )
+
+    assert mod.ensure_running() is None
+    assert mod._info is None
+    assert proc.pid in reset_state
+    assert mod.status()["url"] is None
+
+
+def test_blind_lookup_adopts_real_child_after_recognized_binding_report(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A recognized URL from the trusted child's stdout is positive proof."""
+    proc = FakeProc(pid=4242)
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: proc)
+    monkeypatch.setattr(mod, "_child_reported_binding", lambda child, port: True, raising=False)
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        lambda pid, port: None,
+        raising=False,
+    )
+    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
+    monkeypatch.setattr(platform_compat, "find_port_listeners", lambda port: [])
+    monkeypatch.setattr(
+        platform_compat,
+        "probe_port_listeners",
+        lambda port: ([], True),
+        raising=False,
+    )
+
+    with caplog.at_level("WARNING"):
+        info = mod.ensure_running()
+
+    assert info is not None
+    assert proc.pid not in reset_state
+    assert any("reported that it bound" in r.message for r in caplog.records)
+
+
+def test_port_owner_refuses_when_lookup_attributes_control_but_not_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The port just answered, so a lookup that shows no owner is not ours.
+    """A functional lookup seeing no target owner still means foreign."""
+    proc = FakeProc(pid=4242)
+    target_port = 1
+    looked_up: list[int] = []
 
-    Covers a squatter owned by another user (invisible to our lsof) and a lookup
-    that timed out under load. A refused start is recoverable; adopting an
-    unverified responder is not.
-    """
+    def _target_listeners(port: int) -> list[platform_compat.PortListener]:
+        looked_up.append(port)
+        return []
+
+    def _control_probe(
+        port: int,
+    ) -> tuple[list[platform_compat.PortListener], bool]:
+        looked_up.append(port)
+        return [platform_compat.PortListener(os.getpid(), "127.0.0.1", "4")], True
+
+    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
+    monkeypatch.setattr(platform_compat, "find_port_listeners", _target_listeners)
+    monkeypatch.setattr(
+        platform_compat,
+        "probe_port_listeners",
+        _control_probe,
+        raising=False,
+    )
+
+    assert mod._port_owner(target_port, proc) == mod._OWNER_FOREIGN
+    assert looked_up[0] == target_port
+    assert len(looked_up) == 2
+    assert looked_up[1] != target_port
+
+
+def test_port_owner_refuses_when_control_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout or execution error is not proof that the lookup is blind."""
     proc = FakeProc(pid=4242)
     _stub_port_owner(monkeypatch, listener_pids=())
+    monkeypatch.setattr(
+        platform_compat,
+        "probe_port_listeners",
+        lambda port: ([], False),
+        raising=False,
+    )
+
+    assert mod._port_owner(45613, proc) == mod._OWNER_FOREIGN
+
+
+def test_port_owner_refuses_when_control_listener_cannot_be_created(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No control listener means the lookup was not disproved."""
+    proc = FakeProc(pid=4242)
+    _stub_port_owner(monkeypatch, listener_pids=())
+    monkeypatch.setattr(mod, "_claim_listener", lambda port: None)
 
     assert mod._port_owner(45613, proc) == mod._OWNER_FOREIGN
 
@@ -826,55 +980,317 @@ def test_ensure_running_adopts_a_proven_child(monkeypatch: pytest.MonkeyPatch) -
     assert mod._child_port == info.port
 
 
-def test_ensure_running_adopts_when_ownership_cannot_be_proved(
+def test_ensure_running_adopts_when_tool_absent_but_child_reports_binding(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """No regression on a host where the lookup tool is unavailable.
-
-    Adopting on reachability alone is the pre-identity behaviour, so it is warned
-    about rather than done silently.
-    """
+    """A missing PID lookup is safe when the trusted child proves its bind."""
     monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
     monkeypatch.setattr(mod, "_healthy", lambda port: True)
     monkeypatch.setattr(mod, "_spawn", lambda cli, port: FakeProc(pid=4242))
+    monkeypatch.setattr(mod, "_child_reported_binding", lambda child, port: True)
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        lambda pid, port: None,
+    )
     _stub_port_owner(monkeypatch, listener_pids=(777,), tool=False)
 
     with caplog.at_level("WARNING"):
         assert mod.ensure_running() is not None
 
-    assert any("cannot verify which process holds port" in r.message for r in caplog.records)
+    assert any("reported that it bound" in r.message for r in caplog.records)
 
 
-def test_reuse_refuses_a_squatter_that_took_a_live_childs_port(
+def _blind_host_child(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A child can stay alive after losing its listener; the port is then free.
-
-    Without re-proving ownership on reuse, the next panel mount hands back the
-    squatter that took it.
-    """
+    owns_listener: list[bool | None],
+    spawned: list[FakeProc],
+) -> FakeProc:
+    """Start one child where the global listener lookup cannot attribute owners."""
+    proc = FakeProc(pid=4242)
     monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
     monkeypatch.setattr(mod, "_healthy", lambda port: True)
-    # A FRESH child per spawn. Reusing one fake would let the reaped corpse end
-    # the second attempt at the "exited during startup" check, so the test would
-    # pass without the reuse gate having done anything.
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: spawned.append(proc) or proc)
+    reports = iter((True,))
+    monkeypatch.setattr(
+        mod,
+        "_child_reported_binding",
+        lambda child, port: next(reports, False),
+    )
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        lambda pid, port: owns_listener[0],
+        raising=False,
+    )
+    _stub_port_owner(monkeypatch, listener_pids=(), tool=False)
+    return proc
+
+
+def test_blind_host_reuses_a_proven_live_child_across_three_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+) -> None:
+    owns_listener: list[bool | None] = [True]
     spawned: list[FakeProc] = []
+    proc = _blind_host_child(monkeypatch, owns_listener, spawned)
+
+    first = mod.ensure_running()
+
+    assert first is not None
+    assert mod.ensure_running() == first
+    assert mod.status()["url"] == first.url
+    assert mod.ensure_running() == first
+    assert spawned == [proc]
+    assert reset_state == []
+
+
+def test_blind_host_accepts_a_listener_owned_by_the_spawned_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+) -> None:
+    proc = FakeProc(pid=4242)
+    checked: list[int] = []
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: proc)
+    monkeypatch.setattr(mod, "_child_reported_binding", lambda child, port: False)
+    _stub_port_owner(monkeypatch, listener_pids=(), descendants=(9931,), tool=False)
+
+    def _owns_listener(pid: int, port: int) -> bool:
+        checked.append(pid)
+        return pid == 9931
+
+    monkeypatch.setattr(
+        platform_compat,
+        "process_owns_loopback_listener",
+        _owns_listener,
+    )
+
+    assert mod.ensure_running() is not None
+    assert checked == [4242, 9931]
+    assert reset_state == []
+
+
+def test_live_report_only_child_degrades_without_reaping_after_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+) -> None:
+    owns_listener: list[bool | None] = [None]
+    spawned: list[FakeProc] = []
+    proc = _blind_host_child(monkeypatch, owns_listener, spawned)
+    reports = iter((True, False, False))
+    monkeypatch.setattr(mod, "_child_reported_binding", lambda child, port: next(reports))
+
+    assert mod.ensure_running() is not None
+    assert mod.ensure_running() is None
+    assert mod.status()["url"] is None
+    assert mod._proc is proc
+    assert spawned == [proc]
+    assert reset_state == []
+
+
+def test_dead_recorded_child_keeps_the_existing_respawn_path(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+) -> None:
+    children = [FakeProc(pid=4242), FakeProc(pid=4343)]
+    spawned: list[FakeProc] = []
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(
+        mod, "_spawn", lambda cli, port: spawned.append(children.pop(0)) or spawned[-1]
+    )
+    _stub_port_owner(monkeypatch, listener_pids=(), tool=False)
+
+    first = mod.ensure_running()
+    assert first is not None
+    spawned[0]._alive = False
+    spawned[0].returncode = 1
+
+    second = mod.ensure_running()
+
+    assert second is not None
+    assert len(spawned) == 2
+    assert mod._proc is spawned[1]
+    assert 4242 in reset_state
+
+
+def test_binding_reader_discards_after_proof_budget_until_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chatty child cannot block after the bounded proof window closes."""
+
+    class NeverEof(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop = threading.Event()
+            self.budget_reached = threading.Event()
+            self.reads = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.reads += 1
+            if self.reads >= 4:
+                self.budget_reached.set()
+            return b"" if self.stop.is_set() else b"not the binding report\n"
+
+    stream = NeverEof()
+    proof = mod._BindingProof(port=45613, reported=threading.Event())
+    monkeypatch.setattr(mod, "_BINDING_PROOF_MAX_LINES", 4)
+    monkeypatch.setattr(mod, "_BINDING_PROOF_MAX_BYTES", 4096)
+    monkeypatch.setattr(mod, "_BINDING_PROOF_TIMEOUT_S", 1.0)
+    reader = threading.Thread(
+        target=mod._drain_child_output,
+        args=(stream, 45613, proof),
+        daemon=True,
+    )
+    reader.start()
+    assert stream.budget_reached.wait(timeout=1)
+    reader.join(timeout=0.05)
+    discarding_after_budget = reader.is_alive()
+    stream.stop.set()
+    reader.join(timeout=1)
+
+    assert discarding_after_budget
+    assert not reader.is_alive()
+    assert not proof.reported.is_set()
+
+
+def test_binding_reader_drops_proof_at_the_byte_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = mod._BindingProof(port=45613, reported=threading.Event())
+    stream = io.BytesIO(b"Listening on http://127.0.0.1:45613\n")
+    monkeypatch.setattr(mod, "_BINDING_PROOF_MAX_BYTES", 8)
+
+    mod._drain_child_output(stream, 45613, proof)
+
+    assert not proof.reported.is_set()
+
+
+def test_binding_reader_drains_a_real_pipe_after_the_proof_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(read_fd, "rb", buffering=0)
+    proof = mod._BindingProof(port=45613, reported=threading.Event())
+    payload = b"x" * (1024 * 1024)
+    errors: list[OSError] = []
+    monkeypatch.setattr(mod, "_BINDING_PROOF_MAX_BYTES", 32)
+
+    def _write_payload() -> None:
+        remaining = memoryview(payload)
+        try:
+            while remaining:
+                written = os.write(write_fd, remaining)
+                remaining = remaining[written:]
+        except OSError as exc:
+            errors.append(exc)
+        finally:
+            os.close(write_fd)
+
+    reader = threading.Thread(
+        target=mod._drain_child_output,
+        args=(stream, 45613, proof),
+        daemon=True,
+    )
+    writer = threading.Thread(target=_write_payload, daemon=True)
+    try:
+        reader.start()
+        writer.start()
+        writer.join(timeout=2)
+        write_completed = not writer.is_alive()
+    finally:
+        stream.close()
+        writer.join(timeout=1)
+        reader.join(timeout=1)
+
+    assert write_completed, "the child writer blocked after the proof reader exited"
+    assert errors == []
+    assert not reader.is_alive()
+    assert not proof.reported.is_set()
+
+
+def test_binding_reader_accepts_a_tolerant_listener_banner() -> None:
+    proof = mod._BindingProof(port=45613, reported=threading.Event())
+    stream = io.BytesIO(b"[playwright] Browser view is listening at http://127.0.0.1:45613/\n")
+
+    mod._drain_child_output(stream, 45613, proof)
+
+    assert proof.reported.is_set()
+
+
+def test_binding_reader_logs_when_stdout_has_no_listener_banner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proof = mod._BindingProof(port=45613, reported=threading.Event())
+    stream = io.BytesIO(b"Dashboard ready; no listener URL was reported\n")
+
+    with caplog.at_level("WARNING"):
+        mod._drain_child_output(stream, 45613, proof)
+
+    assert not proof.reported.is_set()
+    assert any(
+        "stdout did not contain a recognized listener address" in r.message for r in caplog.records
+    )
+
+
+def test_binding_reader_switches_to_drain_at_the_time_budget_with_a_silent_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(read_fd, "rb", buffering=0)
+    proof = mod._BindingProof(port=45613, reported=threading.Event())
+    monkeypatch.setattr(mod, "_BINDING_PROOF_TIMEOUT_S", 0.05)
+    reader = threading.Thread(
+        target=mod._drain_child_output,
+        args=(stream, 45613, proof),
+        daemon=True,
+    )
+    try:
+        reader.start()
+        reader.join(timeout=0.2)
+        assert reader.is_alive(), "the reader exited instead of draining after the proof timeout"
+        assert not proof.reported.is_set()
+    finally:
+        os.close(write_fd)
+        reader.join(timeout=1)
+        stream.close()
+    assert not reader.is_alive()
+
+
+def test_reuse_replaces_a_live_child_after_global_squatter_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_state: list[int],
+) -> None:
+    children = [FakeProc(pid=4242), FakeProc(pid=4343)]
+    spawned: list[FakeProc] = []
+    listener_owner = {"pid": 0}
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
+    monkeypatch.setattr(platform_compat, "process_descendants", lambda pid: [])
+    monkeypatch.setattr(
+        platform_compat,
+        "find_port_listeners",
+        lambda port: [platform_compat.PortListener(listener_owner["pid"], "127.0.0.1", "4")],
+    )
 
     def _spawn_fresh(cli: str, port: int) -> FakeProc:
-        child = FakeProc(pid=4242)
+        child = children.pop(0)
         spawned.append(child)
+        listener_owner["pid"] = child.pid
         return child
 
     monkeypatch.setattr(mod, "_spawn", _spawn_fresh)
-    _stub_port_owner(monkeypatch, listener_pids=(4242,))
     first = mod.ensure_running()
     assert first is not None
 
-    # The child is still alive, but a foreign process now answers its port.
-    _stub_port_owner(monkeypatch, listener_pids=(777,))
+    listener_owner["pid"] = 777
 
-    assert mod.ensure_running() is None
-    assert len(spawned) == 2, "the reuse gate did not reject the foreign responder"
+    assert mod.ensure_running() is not None
+    assert [child.pid for child in spawned] == [4242, 4343]
+    assert 4242 in reset_state
 
 
 def test_status_does_not_report_a_squatter_as_running(
@@ -923,7 +1339,8 @@ def test_show_child_registers_in_the_gateway_owned_session_registry(
 
     def fake_popen(argv, **kwargs):  # noqa: ANN001, ANN003
         captured["env"] = dict(kwargs["env"])
-        return FakeProc()
+        assert kwargs["stdout"] is mod.subprocess.PIPE
+        return FakeProc(stdout=b"Listening on http://127.0.0.1:7777\n")
 
     monkeypatch.setattr(mod, "cli_env", lambda: {"PATH": "/n"})
     monkeypatch.setattr(
@@ -936,5 +1353,8 @@ def test_show_child_registers_in_the_gateway_owned_session_registry(
     proc = mod._spawn(["/n/pw"], 7777)
 
     assert proc is not None
+    proof = getattr(proc, "_kirocrew_browser_view_binding")
+    assert proof.reported.wait(timeout=1)
+    assert proof.port == 7777
     assert captured["env"]["PWTEST_SOCKETS_DIR"] == "/root/ui/s"
     assert captured["env"]["PWTEST_DAEMON_SESSION_DIR"] == "/root/ui/d"
