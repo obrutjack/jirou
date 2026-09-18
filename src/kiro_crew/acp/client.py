@@ -8278,7 +8278,7 @@ class AcpClient:
             survivors = [p for p in saved_child_pids if p not in dead_children]
             if dead_children:
                 try:
-                    _untrack_child_pids(dead_children)
+                    _untrack_child_pids(dead_children, parent_pid=saved_pid or 0)
                 except Exception:
                     logger.debug(
                         "untracking child PIDs %s failed", list(dead_children), exc_info=True

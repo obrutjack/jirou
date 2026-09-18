@@ -1279,6 +1279,46 @@ reparented to init and unreachable. Teardown prunes by descendant liveness and
 retains survivors for the orphan sweep. See
 [session](session.md) for the file formats and the sweeps that read them.
 
+**A reaped root does not end the teardown.** `kill_process_tree` is
+`killpg(getpgid(pid))`, and `getpgid` raises once the root has exited — read as
+"already dead", that leaves the launcher's children, the agent and its chat
+process unsignalled in the group, and a root that died a few seconds into its
+life predates every descendant snapshot, so nothing else can find them either.
+`AcpRuntime._signal_tree` runs the tree kill only while the root's number is
+provably still ours — its live start id matches the one recorded at spawn.
+`returncode` is not that proof: asyncio's child watcher does the `waitpid` in
+the background and propagates the code a callback later, so a root can be
+reaped, its number free for a fresh session leader whose `getpgid` succeeds,
+while `returncode` still reads `None`. A root whose identity cannot be read is
+treated as gone. It treats a root that is gone, by either read,
+as the START of a second path, not the end: the root was spawned as a
+session leader, so its pid IS the group id, and
+`session_pid._signal_orphaned_runtime_group` finds that group's members and
+signals THEM — each re-verified by start id at the instant of the signal — never
+the group number, which is the dead root's pid and can be handed to a fresh
+session leader at any moment. A member vouches when it carries this runtime's
+`KIROCREW_SPAWN_INSTANCE` — the per-spawn token `spawn()` puts on the root's
+environment, inherited by its whole tree — together with the `KIROCREW_SPAWNED`
+marker and a runtime argv identity. The instance is the incarnation pin the
+generic marker cannot supply: every runtime is a marked session leader, so a
+root pid released to a fresh spawn names a group that carries the marker just
+as well, and a signal aimed by number and marker alone would terminate that
+fresh runtime's live session. No vouching member, no signal — the number may
+be somebody else's by now. A vouched signal is followed by
+the same grace a live tree gets and a `SIGKILL` pass, since the root's `wait()`
+returned at once and drove no escalation. The escalation never re-resolves the
+root's number — `_signal_tree` skips `kill_process_tree` when it carries
+`expected`, because `getpgid` on a recycled root pid SUCCEEDS for the fresh
+runtime holding it and would have signalled that runtime's group before any
+identity check ran — and it re-signals only members the `SIGTERM` pass vouched
+that are still alive under the same start id. A shutdown that cancels the teardown
+inside the grace still runs that `SIGKILL` pass on the way out, shielded from a
+second cancel: the members were vouched and signalled, and the escalation is the
+only thing still owed. Any other `OSError` (a denied signal)
+is final: the root is there and may not be signalled, so its group is not
+guessed at. The vouching read is Linux-only (the environ read is), so macOS and
+Windows keep the missed reap rather than gain a wrong kill.
+
 **An ownerless server→client request is answered ONCE, at connection level.**
 An inbound frame carrying an `id` **and** a `method` but no `params.sessionId`
 is a request that names no session — it expects exactly one response, so the

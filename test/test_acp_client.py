@@ -4695,7 +4695,7 @@ class TestResetStateExtended:
         ):
             client._reset_state()
 
-        mock_uc.assert_called_once_with({5678: None, 9012: None})
+        mock_uc.assert_called_once_with({5678: None, 9012: None}, parent_pid=1234)
         mock_up.assert_called_once_with(1234)
         mock_usp.assert_called_once_with(1234)
         assert client._child_pids == {}
@@ -4739,7 +4739,8 @@ class TestResetStateExtended:
         ):
             client._reset_state()
 
-        mock_uc.assert_called_once_with({5678: None})
+        # _pid was None here, so there is no root to scope the untrack to.
+        mock_uc.assert_called_once_with({5678: None}, parent_pid=0)
 
     def test_cancels_stderr_task(self):
         client = AcpClient()

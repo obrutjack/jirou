@@ -113,7 +113,11 @@ from kiro_crew.agent_sdk.tool_search import (
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config import live
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.constants import (
+    KIROCREW_SPAWN_INSTANCE_ENV,
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+)
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.claim import mint_stub_session_token, send_claim
@@ -148,6 +152,7 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid import (
     _pid_gone_or_unmanaged,
     _replace_child_pids,
+    _signal_orphaned_runtime_group,
     _track_pid,
     _track_session_pid,
     _untrack_child_pids,
@@ -182,8 +187,11 @@ def _escapee_is_still_ours(pid: int, record: ChildRecord) -> bool:
     return platform_compat.get_process_start_id(pid) == recorded
 
 
-def _prune_dead_descendants(saved: dict[int, ChildRecord]) -> list[int]:
+def _prune_dead_descendants(saved: dict[int, ChildRecord], root_pid: int) -> list[int]:
     """Untrack the descendants that are gone; return the ones still alive.
+
+    *root_pid* scopes the untrack to this runtime's own lines: a dead child's
+    number can already be another runtime's live descendant.
 
     A descendant's entry is pruned by ITS OWN liveness, never by the root's
     fate. One that escaped the group kill (it called setsid, so killpg never
@@ -198,7 +206,7 @@ def _prune_dead_descendants(saved: dict[int, ChildRecord]) -> list[int]:
     dead = {pid: rec for pid, rec in saved.items() if _pid_gone_or_unmanaged(pid)}
     if dead:
         try:
-            _untrack_child_pids(dead)
+            _untrack_child_pids(dead, parent_pid=root_pid)
         except Exception:
             logger.debug(
                 "AcpRuntime: untracking descendant PIDs %s failed", list(dead), exc_info=True
@@ -2248,6 +2256,13 @@ class AcpRuntime:
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+        # The incarnation this spawn is. Minted here, before the process exists,
+        # because it has to travel in the child's environment: it is what a
+        # teardown reads back out of /proc/<pid>/environ to prove a process is
+        # THIS spawn's descendant once the root itself is gone. Random rather
+        # than pid-derived so a recycled pid cannot false-match.
+        spawn_instance = uuid.uuid4().hex[:16]
+        env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
         # Own browser session per agent process, matching AcpClient._spawn (see
         # browser_session_env). Per PROCESS, not per agent: with session sharing
         # on (the default) an eligible subagent's session is created on the
@@ -2318,9 +2333,10 @@ class AcpRuntime:
             self._discard_sandbox_cleanup()
             raise
         self._pid = self._process.pid
-        # Minted with the process it names — random, not pid-derived, so it
-        # cannot false-match a later spawn that the OS handed a recycled pid.
-        self._process_instance = uuid.uuid4().hex[:16]
+        # The same token the child carries in its environment (minted above, so
+        # it could be passed in); random, not pid-derived, so it cannot
+        # false-match a later spawn that the OS handed a recycled pid.
+        self._process_instance = spawn_instance
         # The subprocess is LIVE from here on but nothing has recorded it yet, so
         # this window needs the same guard AcpClient._spawn has. finish_suspended_spawn
         # documents its own resume failure as FATAL, and the identity read can fail;
@@ -2670,6 +2686,83 @@ class AcpRuntime:
                 exc_info=True,
             )
 
+    async def _signal_tree(
+        self,
+        pid: int,
+        sig: int,
+        *,
+        instance: str,
+        expected: dict[int, str | None] | None = None,
+    ) -> dict[int, str | None]:
+        """Signal this runtime's process tree; return the orphans it reached.
+
+        ``kill_process_tree`` is ``killpg(getpgid(pid))``, and ``getpgid`` raises
+        once the root has exited. Read as "already dead", that leaves every
+        process still in the group -- the launcher's children, the agent, its
+        chat process -- unsignalled, reparented to init and holding their
+        memory. A root that dies a few seconds into its life, before any
+        descendant was recorded, is exactly the tree nothing else can find.
+
+        So a reaped root is not the end of the teardown. The root was spawned as
+        a session leader, so its pid IS the group id, and
+        :func:`_signal_orphaned_runtime_group` signals that group once a live
+        member vouches for it by identity -- and by *instance*: the per-spawn
+        token this runtime put in its child's environment, which is what tells
+        the root's own tree from a fresh runtime that took the root's recycled
+        pid and leads a group that vouches just as well. The members it returns are empty for
+        a tree that really is gone, which is what the caller needs to decide
+        whether the grace-and-escalate that ``wait()`` would otherwise have
+        driven is still owed -- and, when it is, they are what the escalation
+        hands back as *expected*, so a group SIGKILL after the grace lands only
+        on the group the SIGTERM did, never on a fresh runtime that took the
+        root's number in between.
+
+        Windows has no process groups; ``kill_process_tree`` walks the tree with
+        ``taskkill /T`` there and a reaped root means the walk found nothing.
+        Every call is off-loop: ``taskkill`` is a blocking spawn, and the group
+        walk reads ``/proc``.
+        """
+        loop = asyncio.get_running_loop()
+        # kill_process_tree resolves the group FROM the root's number, so it may
+        # run only while that number is provably still ours, and the one proof
+        # is the live start id matching the one recorded at spawn. ``returncode``
+        # is NOT that proof: asyncio's child watcher does the waitpid in the
+        # background and propagates the code to the Process object a callback
+        # later, so a root can be reaped -- its number free for a fresh session
+        # leader whose getpgid SUCCEEDS -- while ``returncode`` still reads None.
+        # A root whose identity cannot be read is treated as gone: the vouched
+        # path below reaches its members where it can, and where it cannot the
+        # cost is a leak the sweep reports, never a signal to a stranger. The
+        # same reasoning bars re-resolving on the escalation (``expected`` set).
+        if expected is None and self._root_identity_holds():
+            try:
+                await loop.run_in_executor(
+                    subprocess_executor(),
+                    lambda: platform_compat.kill_process_tree(pid, sig),
+                )
+                return {}
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return {}
+        if not platform_compat.IS_POSIX:
+            return {}
+        reached = await loop.run_in_executor(
+            subprocess_executor(),
+            functools.partial(
+                _signal_orphaned_runtime_group, pid, sig, instance, expected=expected
+            ),
+        )
+        if reached:
+            logger.warning(
+                "AcpRuntime kill: root PID %d was already gone; signalled %d orphaned "
+                "member(s) of its process group with signal %d",
+                pid,
+                len(reached),
+                sig,
+            )
+        return reached
+
     # Grace window for SIGTERM before escalating, and the post-SIGKILL reap
     # window. Class attributes so tests can shrink them.
     _KILL_TERM_TIMEOUT = 5.0
@@ -2734,30 +2827,46 @@ class AcpRuntime:
             # shim shells out to taskkill (a blocking subprocess.run), which
             # must not run on the event loop (no blocking call on the event
             # loop).
-            loop = asyncio.get_running_loop()
-            try:
-                await loop.run_in_executor(
-                    subprocess_executor(),
-                    lambda: platform_compat.kill_process_tree(pid, platform_compat.SIGTERM),
-                )
-            except (OSError, ProcessLookupError):
-                pass
+            # Read before the kill clears it: the group fallback needs the
+            # incarnation this process was spawned as, not the empty successor.
+            instance = self._process_instance
+            orphaned_group = await self._signal_tree(
+                pid, platform_compat.SIGTERM, instance=instance
+            )
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=self._KILL_TERM_TIMEOUT)
             except asyncio.TimeoutError:
-                try:
-                    await loop.run_in_executor(
-                        subprocess_executor(),
-                        lambda: platform_compat.kill_process_tree(pid, platform_compat.SIGKILL),
-                    )
-                except (OSError, ProcessLookupError):
-                    pass
+                await self._signal_tree(pid, platform_compat.SIGKILL, instance=instance)
                 # Reap the child so a delivered SIGKILL doesn't leave a zombie
                 # that the liveness probe below would misread as a survivor.
                 try:
                     await asyncio.wait_for(self._process.wait(), timeout=self._KILL_REAP_TIMEOUT)
                 except asyncio.TimeoutError:
                     pass
+            if orphaned_group:
+                # The root was already gone, so wait() above returned at once and
+                # the escalation never ran for the members left in the group.
+                # Give them the same grace a live tree gets, then escalate to
+                # the group -- aimed by the members the SIGTERM vouched, not by
+                # the root's number, which a fresh runtime can hold by now.
+                escalate = functools.partial(
+                    self._signal_tree,
+                    pid,
+                    platform_compat.SIGKILL,
+                    instance=instance,
+                    expected=orphaned_group,
+                )
+                try:
+                    await asyncio.sleep(self._KILL_TERM_TIMEOUT)
+                except asyncio.CancelledError:
+                    # A shutdown that cancels this teardown inside the grace must
+                    # not leave SIGTERM-ignoring members alive: they were vouched
+                    # and signalled, and the SIGKILL is the only thing still
+                    # owed. Shielded so a second cancel cannot cut it short; it
+                    # is one identity re-check per member and a signal each.
+                    await asyncio.shield(escalate())
+                    raise
+                await escalate()
             self._process = None
             # The id names the process that just ended; the next spawn mints its
             # own, and nothing may answer with this one in between.
@@ -2793,7 +2902,7 @@ class AcpRuntime:
             saved_children = dict(self._child_pids)
             self._child_pids = {}
             if saved_children:
-                survivors = await asyncio.to_thread(_prune_dead_descendants, saved_children)
+                survivors = await asyncio.to_thread(_prune_dead_descendants, saved_children, pid)
                 if survivors:
                     logger.warning(
                         "AcpRuntime: retained tracking for %d descendant PID(s) that "
