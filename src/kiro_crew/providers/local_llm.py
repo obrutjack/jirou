@@ -164,6 +164,70 @@ class LocalLLMProvider(LLMProvider):
             self._client = None
         self._messages = []
 
+    # ── Context trimming ──────────────────────────────────────────────────────
+
+    # Marker KiroCrew uses to separate injected context from the actual request.
+    _USER_REQUEST_MARKER = "[CURRENT USER REQUEST -- respond to this]"
+
+    # Max chars to keep from the injected context block (before the user request).
+    # ~2000 chars ≈ 500 tokens — small enough to keep prefill under 4096 context.
+    # Override with LOCAL_LLM_MAX_CONTEXT_CHARS env var.
+    # Issue #6 tracks replacing this with proper source-side reduction once
+    # context_window_tokens() is confirmed to actually reduce KiroCrew's injection.
+    _DEFAULT_MAX_CONTEXT_CHARS = 2_000
+
+    def _trim_kirocrew_message(self, raw: str) -> str:
+        """Trim KiroCrew's injected context down to the actual user request.
+
+        KiroCrew prepends ~60K chars of agent context to every user turn.
+        Without trimming this exceeds the 4096-token LM Studio context window.
+
+        Strategy: keep the last MAX_CONTEXT_CHARS of the context block + the
+        full actual user question. When the marker is not found (non-KiroCrew
+        message), return the raw message unchanged with a WARNING so it's visible.
+
+        Issue #6: this is a fragile workaround. The correct fix is source-side
+        reduction via context_window_tokens() — tracked separately.
+        """
+        marker = self._USER_REQUEST_MARKER
+        idx = raw.find(marker)
+        if idx == -1:
+            # Not a KiroCrew-format message — pass through unchanged.
+            # If this is a KiroCrew message with a changed marker, this is a
+            # regression: the full 60K+ context will be sent and LM Studio will
+            # reject it. Log a WARNING so the failure is visible.
+            if len(raw) > 10_000:
+                logger.warning(
+                    "[LocalLLM] ⚠️ Large message (%d chars) without KiroCrew marker — "
+                    "passing through unchanged. If LM Studio rejects it, the marker "
+                    "text may have changed upstream. See issue #6.",
+                    len(raw),
+                )
+            return raw
+
+        context_block = raw[:idx].strip()
+        user_request  = raw[idx + len(marker):].strip()
+
+        max_chars = int(_env("LOCAL_LLM_MAX_CONTEXT_CHARS",
+                             str(self._DEFAULT_MAX_CONTEXT_CHARS)))
+
+        if len(context_block) > max_chars:
+            trimmed = context_block[-max_chars:]
+            nl = trimmed.find("\n")
+            if nl != -1:
+                trimmed = trimmed[nl + 1:]
+            logger.warning(
+                "[LocalLLM] ✂️ Trimmed context from %d → %d chars (keeping last %d). "
+                "Full injection size confirms context_window_tokens() is NOT reducing "
+                "KiroCrew's injection. See issue #6.",
+                len(context_block), len(trimmed), max_chars,
+            )
+            context_block = trimmed
+
+        if context_block:
+            return f"{context_block}\n\n{user_request}"
+        return user_request
+
     # ── Core: stream ──────────────────────────────────────────────────────────
 
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
@@ -171,13 +235,10 @@ class LocalLLMProvider(LLMProvider):
         if not self._client:
             await self.start()
 
-        # Append user message and build the call payload.
-        # Note: KiroCrew injects ~60K chars of agent context into the user message.
-        # context_window_tokens() reports this provider's window size so KiroCrew
-        # scales down its injection at the source (budget ∝ window / 1,000,000).
-        # We do NOT post-hoc truncate here — see issues #6 and #3 for the
-        # investigation plan to verify source-side reduction is working.
-        self._messages.append({"role": "user", "content": message})
+        # Trim KiroCrew's injected context before appending to history.
+        # Without this, the 60K+ char injection exceeds the LM Studio context window.
+        trimmed_message = self._trim_kirocrew_message(message)
+        self._messages.append({"role": "user", "content": trimmed_message})
         messages_for_call = list(self._messages)
 
         # ── Context size diagnostic ───────────────────────────────────────────
