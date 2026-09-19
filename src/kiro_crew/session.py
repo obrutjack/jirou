@@ -2430,6 +2430,10 @@ class SessionManager:
         """Delegate exact-session recycle while its semaphore is held."""
         await self._compaction._recycle_held(key, session, pct)
 
+    async def _recycle_unmanaged(self, key: str, session: "_Session", pct: float) -> str:
+        """Delegate the recycle for a backend no compaction path can reach."""
+        return await self._compaction._recycle_unmanaged(key, session, pct)
+
     async def _compact_in_place(self, key: str, session: "_Session", pct: float) -> str:
         """Delegate in-place compaction under turn exclusion."""
         return await self._compaction._compact_in_place(key, session, pct)

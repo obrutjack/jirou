@@ -50,6 +50,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
+)
 from kiro_crew.cron import (
     CronStoreBusy,
     CronStoreUnreadable,
@@ -337,17 +341,148 @@ def compact_unsupported_backend(provider: Any) -> str | None:
     return None
 
 
+def compaction_is_harness_managed(backend: str) -> bool:
+    """True when *backend* summarizes on its own and reports it on the wire.
+
+    The question every surface has to answer once it knows a manual ``/compact``
+    cannot be dispatched: does something else bound this context, or does
+    nothing?  Membership in ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION``
+    (harness-parity H6) rather than a per-channel guess, because the two answers
+    need two different sentences and the wrong one is a claim the product cannot
+    keep.
+
+    Exported for the surfaces that speak their own language: they hold their own
+    translated pair of strings and ask this to choose between them, so the
+    MEMBERSHIP lives in one place while the wording stays local.
+    """
+    return backend in ACP_BACKENDS_HARNESS_MANAGED_COMPACTION
+
+
+def compaction_is_recycled(backend: str) -> bool:
+    """True when Crew answers *backend*'s full context by recycling the session.
+
+    The second of the two questions a surface has to ask once it knows a manual
+    ``/compact`` cannot be dispatched, and the one that decides whether a user may
+    be told a fresh session is coming. Membership in
+    ``ACP_BACKENDS_CONTEXT_RECYCLE`` (harness-parity H6) rather than "not
+    harness-managed", because that negation is what promised an unclassified
+    harness a restart Crew does not perform.
+
+    Exported alongside :func:`compaction_is_harness_managed` for the surfaces
+    that hold their own wording: the two predicates together pick one of three
+    sentences, so the MEMBERSHIPS live in one place while the words stay local.
+    """
+    return backend in ACP_BACKENDS_CONTEXT_RECYCLE
+
+
+#: The three answers a surface can give a backend it cannot compact. One name per
+#: answer, so a surface maps arms to its own wording instead of re-deriving the
+#: choice from memberships -- which is how two surfaces came to hold a single
+#: sentence that covered all three.
+COMPACT_ARM_HARNESS_MANAGED = "harness_managed"
+COMPACT_ARM_RECYCLED = "recycled"
+COMPACT_ARM_UNCLASSIFIED = "unclassified"
+
+
+def compact_refusal_arm(backend: str) -> str:
+    """Which of the three refusals *backend* is owed.
+
+    The ONE place the choice is made. Every surface asks this and maps the answer
+    to its own words; none of them re-reads the memberships, because a surface
+    that derives the choice for itself is a surface that can disagree with the
+    others -- and can silently miss an arm added later.
+
+    - :data:`COMPACT_ARM_HARNESS_MANAGED` -- the harness summarizes unasked and
+      reports it, so nothing is lost by declining.
+    - :data:`COMPACT_ARM_RECYCLED` -- Crew restarts the session when the context
+      fills, which keeps it usable and loses what the agent remembered.
+    - :data:`COMPACT_ARM_UNCLASSIFIED` -- neither is established, so the surface
+      must promise neither.
+
+    Returns the unclassified arm for an unknown id, which is the arm that claims
+    nothing: a backend this build cannot name has certainly not been shown to
+    manage its own context, and has certainly not been granted a recycle.
+    """
+    if compaction_is_harness_managed(backend):
+        return COMPACT_ARM_HARNESS_MANAGED
+    if compaction_is_recycled(backend):
+        return COMPACT_ARM_RECYCLED
+    return COMPACT_ARM_UNCLASSIFIED
+
+
 def compact_unsupported_reply(backend: str) -> str:
     """Informational reply for a manual ``/compact`` on an unsupported *backend*.
 
-    Mirrors the dashboard's wording: the backend manages compaction
-    automatically (the same relationship the ``cc_managed`` decline encodes),
-    so the refusal is information, never an error.
+    THREE sentences, not one, because "Crew cannot hand this backend
+    ``/compact``" covers three quite different situations and no single sentence
+    is true of all of them.  Each arm is a positive membership, so a backend
+    nobody has classified cannot fall into a claim by accident.
+
+    A member of ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` gets the dashboard's
+    wording: it summarizes on its own as context fills (the same relationship the
+    ``cc_managed`` decline encodes), so the refusal is information and nothing is
+    lost.
+
+    A member of ``ACP_BACKENDS_CONTEXT_RECYCLE`` gets the second, which names the
+    outcome rather than implying there is none: Crew restarts the session at the
+    context threshold, keeping the session usable and losing the agent's memory
+    of the conversation.  Saying "manages compaction automatically" there would
+    be the one thing this reply must not do -- promise a summary that never
+    happens.
+
+    A backend in neither set gets the third, and it promises NOTHING, because
+    nothing has been established about it.  That arm is what lets an unclassified
+    harness be answered honestly instead of guessed at: it does not claim the
+    harness summarizes, and it does not claim Crew will step in, because neither
+    is known.
     """
+    arm = compact_refusal_arm(backend)
+    if arm == COMPACT_ARM_HARNESS_MANAGED:
+        return (
+            f"ℹ️ The `{backend}` backend manages compaction automatically — it "
+            "summarizes the conversation on its own as context fills, so manual "
+            "`/compact` isn't needed (and isn't supported) here."
+        )
+    if arm == COMPACT_ARM_RECYCLED:
+        return (
+            f"ℹ️ The `{backend}` backend offers no compaction — there is no "
+            "`/compact` to run and it summarizes nothing on its own. Kiro Crew starts a "
+            "fresh session for you when the context fills, which keeps this chat working "
+            "but the agent will not remember the earlier turns. Use `/new` to start fresh "
+            "on your own terms."
+        )
     return (
-        f"ℹ️ The `{backend}` backend manages compaction automatically — it "
-        "summarizes the conversation on its own as context fills, so manual "
-        "`/compact` isn't needed (and isn't supported) here."
+        f"ℹ️ Manual `/compact` isn't available on the `{backend}` backend, and "
+        "Kiro Crew can't compact it for you either. Start a new chat with `/new` before "
+        "the context fills up."
+    )
+
+
+def compact_unsupported_reply_zh(backend: str) -> str:
+    """The same three refusals as :func:`compact_unsupported_reply`, in Chinese.
+
+    Three surfaces speak Chinese to their users -- feishu, WeCom and WeChat --
+    and all three said these sentences the same way, character for character.
+    Held per surface they are three copies of one wording, which is three places
+    to edit and three places to drift; held here they are the wording, once,
+    chosen by the same memberships the English reply reads.
+
+    A surface whose wording genuinely differs keeps its own string instead of
+    calling this. What must not come back is a second surface copying this text
+    verbatim into itself.
+    """
+    arm = compact_refusal_arm(backend)
+    if arm == COMPACT_ARM_HARNESS_MANAGED:
+        return "ℹ️ 当前后端会自动压缩上下文，无需手动 /compact。"
+    if arm == COMPACT_ARM_RECYCLED:
+        return (
+            "ℹ️ 当前后端不支持压缩上下文，也不会自动摘要。上下文接近上限时，"
+            "Kiro Crew 会自动开启新会话：对话可以继续，但助手不再记得之前的内容。"
+            "你也可以随时发 /new 自己开新会话。"
+        )
+    return (
+        "ℹ️ 当前后端不支持手动 /compact，Kiro Crew 也无法替它压缩上下文。"
+        "上下文快满之前，请发 /new 开始新会话。"
     )
 
 

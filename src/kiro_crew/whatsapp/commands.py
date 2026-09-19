@@ -164,6 +164,25 @@ COMPACT_AUTO_MANAGED_TEXT = (
     "conversation on its own as context fills, so manual /compact isn't "
     "needed (and isn't supported) here."
 )
+#: The second of three, for a backend Crew RECYCLES. Same plain-text voice, and
+#: it names the outcome rather than implying there is none -- sending the first
+#: instead would promise a summary that never happens. Tracks
+#: ``messaging.commands.compact_unsupported_reply``.
+COMPACT_UNMANAGED_TEXT = (
+    "This backend offers no compaction; there is no /compact to run and it "
+    "summarizes nothing on its own. Kiro Crew starts a fresh session for you "
+    "when the context fills, which keeps this chat working but the agent will "
+    "not remember the earlier turns. Send /new to start fresh on your own terms."
+)
+#: The third, for a backend in NEITHER set, and it promises nothing because
+#: nothing is established about it. Sending the sibling above to such a backend
+#: is the defect this arm exists to prevent: Crew does not recycle an
+#: unclassified harness, so telling its user a fresh session is coming describes
+#: something that will not happen.
+COMPACT_UNCLASSIFIED_TEXT = (
+    "Manual /compact isn't available on this backend, and Kiro Crew can't compact "
+    "it for you either. Send /new to start a new chat before the context fills up."
+)
 #: The hard-threshold notice, sent AFTER the automatic compaction it reports.
 COMPACT_AUTO_TEXT = "Context was near its limit, so it was compacted automatically."
 #: The soft-threshold nudge, sent once per conversation until a compaction or a

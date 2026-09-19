@@ -23,7 +23,12 @@ from kiro_crew.messaging.approval import (
     parse_approval_reply,
     pending_for,
 )
-from kiro_crew.messaging.commands import compact_unsupported_backend
+from kiro_crew.messaging.commands import (
+    COMPACT_ARM_HARNESS_MANAGED,
+    COMPACT_ARM_RECYCLED,
+    compact_refusal_arm,
+    compact_unsupported_backend,
+)
 from kiro_crew.messaging.conversation import (
     ConversationState,
     reserve_new_generation,
@@ -45,6 +50,8 @@ from kiro_crew.whatsapp.commands import (
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
     COMPACT_NOTHING_TEXT,
+    COMPACT_UNCLASSIFIED_TEXT,
+    COMPACT_UNMANAGED_TEXT,
     COMPACTED_TEXT,
     CONTEXT_LONG_TEXT,
     NEW_SESSION_TEXT,
@@ -81,6 +88,26 @@ REACTION_DONE = "\N{WHITE HEAVY CHECK MARK}"
 REACTION_FAILED = "\N{WARNING SIGN}"
 #: Clearing is a reaction with an empty body, per the WhatsApp convention.
 REACTION_CLEAR = ""
+
+
+def _compact_refusal_text(backend: str) -> str:
+    """Which of this surface's three refusals *backend* gets.
+
+    WhatsApp keeps its own plain-text voice rather than calling
+    ``messaging.commands.compact_unsupported_reply``, so the three-way CHOICE has
+    to be made here too -- and it is the choice, not the wording, that carries the
+    defect: a two-way split on "harness-managed or not" sends the recycle promise
+    to every backend Crew does not recycle, including one in no compaction set at
+    all. The choice itself comes from ``messaging.commands.compact_refusal_arm``,
+    so this surface supplies wording only and cannot disagree with the others
+    about which case a backend is in.
+    """
+    arm = compact_refusal_arm(backend)
+    if arm == COMPACT_ARM_HARNESS_MANAGED:
+        return COMPACT_AUTO_MANAGED_TEXT
+    if arm == COMPACT_ARM_RECYCLED:
+        return COMPACT_UNMANAGED_TEXT
+    return COMPACT_UNCLASSIFIED_TEXT
 
 
 class WhatsAppDispatcher:
@@ -307,7 +334,7 @@ class WhatsAppDispatcher:
             unsupported = compact_unsupported_backend(provider)
             if unsupported:
                 logger.debug("whatsapp: manual /compact declined — %s compacts itself", unsupported)
-                await self._say(scope, COMPACT_AUTO_MANAGED_TEXT)
+                await self._say(scope, _compact_refusal_text(unsupported))
                 return
             await provider.compact()
             await provider.wait_for_compaction()

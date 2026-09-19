@@ -103,6 +103,8 @@ class _CompactionOwner(Protocol):
 
     async def _recycle_held(self, key: str, session: Any, pct: float) -> None: ...
 
+    async def _recycle_unmanaged(self, key: str, session: Any, pct: float) -> str: ...
+
     def _settle_compact_cooldown(
         self, key: str, provider: LLMProvider, pct_before: float
     ) -> bool: ...
@@ -145,6 +147,44 @@ def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
     """
     backend = getattr(provider, "manual_compact_unsupported_backend", None)
     return backend if isinstance(backend, str) and backend else None
+
+
+def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:
+    """Backend id this provider names as compacted by NOBODY, else None.
+
+    The strictly narrower question :func:`_compact_unsupported_backend` leaves
+    open.  That one says Crew may not send a ``/compact`` prompt; this one says
+    what happens instead.  A harness that summarizes on its own initiative and
+    reports it (``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION``) answers ``None``
+    here even though it answers a backend id there, because its context IS
+    bounded -- Crew simply is not the one bounding it.  A harness that answers a
+    backend id to BOTH has no compaction anywhere Crew can see, so skipping its
+    threshold is not a decline but a leak.
+
+    Read with the same consumption contract as its sibling, and for the same
+    reason: only a non-empty ``str`` counts, so the ``object()`` and
+    ``MagicMock`` providers the compaction suite drives this gate with cannot
+    have a truthy attribute mistaken for a positive claim that nothing compacts.
+    """
+    backend = getattr(provider, "compaction_unmanaged_backend", None)
+    return backend if isinstance(backend, str) and backend else None
+
+
+def _compaction_harness_managed(provider: LLMProvider) -> bool:
+    """True when the harness POSITIVELY claims it bounds its own context.
+
+    The two reasons a decline happens, told apart. A member of
+    ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` answers a backend id to
+    :func:`_compact_unsupported_backend` and ``None`` to
+    :func:`_compaction_unmanaged_backend`, and so does a backend in NO compaction
+    set at all -- the two are indistinguishable from those two answers alone,
+    which is why this asks the provider its own third question instead of
+    inferring from them. A provider that does not answer it is taken as
+    harness-managed, matching the ABC default: that is the reading that changes
+    no log line.
+    """
+    claimed = getattr(provider, "compaction_self_managed", None)
+    return claimed is not False
 
 
 class CompactionCoordinator:
@@ -328,17 +368,25 @@ class CompactionCoordinator:
         if pct < self.effective_autocompact_pct(key):
             return "below_threshold"
         unsupported = _compact_unsupported_backend(provider)
-        if unsupported is not None:
-            # Declining, not recycling. The one current non-member (KAS)
-            # summarizes on its own initiative and its
-            # ``summarization_completed`` frame calls
+        if unsupported is not None and _compaction_unmanaged_backend(provider) is None:
+            # Declining, not recycling, and ONLY for a harness that positively
+            # claims the other side of the bargain. A member of
+            # ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` (KAS) summarizes on its
+            # own initiative and its ``summarization_completed`` frame calls
             # ``reset_after_compaction()`` on the meter
             # (``acp/session_handle.py``), so the reading this gate just read
             # falls back below the threshold without us acting -- the same
             # relationship ``cc_managed`` encodes for Claude-Code sessions.
-            # Recycling sooner would not have been the smaller harm: it
-            # destroys the live conversation, which is the second half of the
-            # reported defect and not merely its consequence.
+            # Recycling such a session would not have been the smaller harm: it
+            # destroys a live conversation that was about to shrink on its own.
+            #
+            # A harness that cannot be handed ``/compact`` AND makes no such
+            # claim takes the other arm: it falls through this rung entirely,
+            # past ``unconfirmed`` / ``in_progress`` / ``cooldown``, and
+            # ``_compact_session`` recycles it. Reaching those three rungs first
+            # is the point of falling through rather than returning here -- an
+            # unconfirmed reading must not spend a recycle, and neither must a
+            # second concurrent trigger.
             #
             # Surfaced the way the gate's own rungs are surfaced: one
             # ``logger.info`` from HERE, as ``unconfirmed``, ``in_progress`` and
@@ -351,13 +399,32 @@ class CompactionCoordinator:
             # ``cc_managed``'s: the key, the reading, AND which backend
             # answered. INFO, not WARNING: a standing correct condition is not
             # an anomaly, and every sibling rung is INFO too.
-            self._deps.logger.info(
-                "Session %s context at %.0f%% -- %s manages compaction itself; "
-                "skipping the /compact dispatch it cannot answer",
-                key,
-                pct,
-                unsupported,
-            )
+            if _compaction_harness_managed(provider):
+                self._deps.logger.info(
+                    "Session %s context at %.0f%% -- %s manages compaction itself; "
+                    "skipping the /compact dispatch it cannot answer",
+                    key,
+                    pct,
+                    unsupported,
+                )
+            else:
+                # Neither compaction set claims this backend, so nothing here is
+                # KNOWN to bound its context. Declining is still the right
+                # ACTION -- the alternative ends a conversation, and no harness
+                # earns that by never having been classified -- but it is not a
+                # standing correct condition the way the branch above is. So it
+                # is a WARNING naming the decision that is missing, rather than
+                # an INFO sitting beside the rungs that are settled, where the
+                # one reading an operator can act on would be invisible.
+                self._deps.logger.warning(
+                    "Session %s context at %.0f%% -- %s claims neither "
+                    "harness-managed compaction nor a context recycle, so nothing "
+                    "Crew can see bounds its context; declining rather than "
+                    "recycling, and the backend needs a membership in one of the two",
+                    key,
+                    pct,
+                    unsupported,
+                )
             return "compact_unsupported"
         if self._deps.context_pct_is_unknown(provider):
             self._deps.logger.info(
@@ -446,6 +513,16 @@ class CompactionCoordinator:
 
             if session is None:
                 return "absent"
+            if _compaction_unmanaged_backend(session.provider) is not None:
+                # No ``/compact`` to send and no harness-side summarization to
+                # wait for, so there is nothing for ``_compact_in_place`` to do
+                # except spend its whole timeout proving it: the prompt would
+                # land as ordinary text, no compaction status would follow, and
+                # ``wait_for_compaction`` would strand until the deadline before
+                # recycling anyway. Recycle straight away instead -- same
+                # destination, none of the wait, and the reason is stated rather
+                # than inferred from a timeout.
+                return await owner._recycle_unmanaged(key, session, pct)
             outcome = await owner._compact_in_place(key, session, pct)
             if outcome == "busy":
                 # A held turn is a deferral, not a failure: no recycle,
@@ -497,6 +574,35 @@ class CompactionCoordinator:
             if owner._recycling.get(key) is session:
                 owner._recycling.pop(key, None)
 
+    async def _recycle_unmanaged(self, key: str, session: Any, pct: float) -> str:
+        """Recycle a session no compaction path can reach, turn-exclusive.
+
+        The threshold answer for a backend in neither ``ACP_BACKENDS_COMPACT``
+        nor ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION``.  Its context grows until
+        the harness's own window ends the conversation for it, so bounding the
+        context is the only outcome available -- and it is the SAME outcome
+        ``_compact_in_place`` already reaches when a compaction fails, taken
+        without first spending the timeout that proves the compaction cannot
+        happen.
+
+        Turn exclusion is acquired the way ``_compact_in_place`` acquires it,
+        and for the identical reason: ``_recycle_held`` shuts the provider down,
+        and a queued turn that entered meanwhile would be talking to a process
+        that is going away.  A held turn answers ``busy`` -- a deferral, not a
+        failure, so no cooldown and no failure callback, matching the ``busy``
+        contract ``_compact_session`` already documents.
+        """
+        timeout = self._deps.compact_wait_timeout_secs()
+        try:
+            await asyncio.wait_for(session.semaphore.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return "busy"
+        try:
+            await self._owner._recycle_held(key, session, pct)
+        finally:
+            session.semaphore.release()
+        return "recycled"
+
     async def _compact_in_place(self, key: str, session: Any, pct: float) -> str:
         """Run native ``/compact`` while excluding turns on this session.
 
@@ -529,6 +635,14 @@ class CompactionCoordinator:
                     ):
                         status = event.text
                 if status is None:
+                    # No special case for an inline harness HERE. This loop
+                    # drives the harness through ``stream_command`` rather than
+                    # ``provider.compact()``, and the wait below is the method
+                    # that answers immediately for a member of
+                    # ``ACP_BACKENDS_INLINE_COMPACTION`` -- so both routes to a
+                    # compaction settle in ONE place. Teaching this one call
+                    # site instead would have left the same strand at every
+                    # other site that awaits a compaction.
                     result_wait_used = self._deps.compact_result_wait_secs(
                         time.monotonic() - started
                     )
