@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { cleanup, screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import SessionsTab, { groupingFor, heatClass, UNAVAILABLE_GROUPINGS } from '../pages/system/SessionsTab'
 import type { PlaneState } from '../pages/SystemPage'
@@ -180,6 +180,179 @@ describe('SessionsTab render', () => {
     await waitFor(() => {
       expect(screen.getByTestId('empty-state')).toBeInTheDocument()
     })
+  })
+})
+
+// ── Session lineage: who opened whom ──
+
+describe('Created-by citation', () => {
+  function withLineage() {
+    const payload = defaultPayload()
+    const base = payload.sessions[0]
+    payload.sessions.push(
+      {
+        ...base,
+        key: 'dashboard:chat-2',
+        title: 'Worker opened by debugging',
+        slot_key: 'chat-2',
+        pid: 1004,
+        parent: { slot: 'chat-1', key: 'dashboard:chat-1' },
+      },
+      {
+        ...base,
+        key: 'dashboard:chat-3',
+        title: 'Worker whose conductor closed',
+        slot_key: 'chat-3',
+        pid: 1005,
+        parent: { slot: 'chat-99-gone', key: null },
+      },
+    )
+    return payload
+  }
+
+  it('names the creator in visible text on a created row that is not nested under it', async () => {
+    // Visible text, not a title attribute: a keyboard or touch reader never sees
+    // a native tooltip, and on the top-level row whose creator is not running
+    // this is the only place the citation can be read at all.
+    mockSessionsMemory.mockResolvedValue(withLineage())
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Worker whose conductor closed')).toBeInTheDocument()
+    })
+    // The orphan names the slot its crew log cited; nothing else knows the creator.
+    expect(screen.getByText('Created by chat-99-gone (not running)')).toBeInTheDocument()
+    // Rows start expanded, so the nested row is on screen under its creator,
+    // whose expander says what it hides: that place IS the citation, so the
+    // nested row does not repeat its creator's name beside its own.
+    expect(screen.getByRole('button', { name: /Collapse sessions under Debugging session/ })).toBeInTheDocument()
+    expect(screen.getByText('Worker opened by debugging')).toBeInTheDocument()
+    expect(screen.queryByText('Created by Debugging session')).toBeNull()
+    expect(screen.getAllByText(/^Created by /)).toHaveLength(1)
+    // Nothing cites the tooltip: no name cell carries a "Created by" title.
+    expect(document.querySelector('[title*="Created by"]')).toBeNull()
+  })
+
+  it('keeps the orphan citation under a fold, where the parent row is a group row', async () => {
+    // Under Group by, a top-level row's parent row is the synthetic group row,
+    // so nesting cannot be read off the row tree; the row's own `nested` flag
+    // from buildTree is what decides, and the orphan still says who opened it.
+    mockSessionsMemory.mockResolvedValue(withLineage())
+    const ref = makePlaneStateRef()
+    ref.current = { sessions: { sorting: [], groupBy: 'agent', filter: '', visibility: {} } }
+    renderWithProviders(<SessionsTab planeStateRef={ref} />)
+    await waitFor(() => {
+      expect(screen.getByText('Worker whose conductor closed')).toBeInTheDocument()
+    })
+    expect(screen.getByText('Created by chat-99-gone (not running)')).toBeInTheDocument()
+    expect(screen.getAllByText(/^Created by /)).toHaveLength(1)
+  })
+
+  it('counts the rows a folded session hides beside its name', async () => {
+    mockSessionsMemory.mockResolvedValue(withLineage())
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Worker opened by debugging')).toBeInTheDocument()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Collapse sessions under Debugging session/ }))
+    await waitFor(() => {
+      expect(screen.queryByText('Worker opened by debugging')).toBeNull()
+    })
+    // The worker and the task under Debugging session: two hidden rows, said
+    // beside the folded name so the parent's own figures are not read as a sum.
+    const debugging = screen.getByText('Debugging session').closest('td')!
+    expect(debugging.textContent).toContain('2')
+    // The numeral says what it is, spoken and on hover: hidden rows, all
+    // descendants, which is not what the group-row count beside it counts.
+    expect(debugging.querySelector('[title="2 hidden rows"]')).not.toBeNull()
+    expect(debugging.querySelector('[aria-label="2 hidden rows"]')).not.toBeNull()
+  })
+
+  it('draws one guide line per ancestor level, so depth reads off lines and not indent alone', async () => {
+    // Sorting orders each parent's children by the sorted column, so a depth-1
+    // row can render below a depth-2 one and, with indent as the only cue, read
+    // as deeper still. The lines under the ancestors' expanders say what a row
+    // hangs from, whatever sits above it on screen.
+    const payload = withLineage()
+    payload.sessions.push({
+      ...payload.sessions[0],
+      key: 'dashboard:chat-4',
+      title: 'Worker of the worker',
+      slot_key: 'chat-4',
+      pid: 1006,
+      parent: { slot: 'chat-2', key: 'dashboard:chat-2' },
+    })
+    mockSessionsMemory.mockResolvedValue(payload)
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Worker of the worker')).toBeInTheDocument()
+    })
+    const guides = (name: string) =>
+      screen.getByText(name).closest('td')!.querySelectorAll('[data-depth-guide]').length
+    expect(guides('Debugging session')).toBe(0)
+    expect(guides('Worker opened by debugging')).toBe(1)
+    expect(guides('Worker of the worker')).toBe(2)
+    // The orphan is top-level: its citation, not a line, says who opened it.
+    expect(guides('Worker whose conductor closed')).toBe(0)
+  })
+
+  it('says nothing about a creator on a session nobody created', async () => {
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Debugging session')).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/^Created by /)).toBeNull()
+  })
+
+  it('shows no not-scanned stat when the scan read every session log', async () => {
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Debugging session')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Session logs skipped')).toBeNull()
+  })
+
+  it('reports session logs the scan did not reach in the footer when there are any', async () => {
+    // The backend caps how many session logs one scan reads and counts the
+    // rest; a session whose log went unread shows no creator, which would read
+    // exactly like one nobody created. The count is the difference.
+    const payload = defaultPayload()
+    mockSessionsMemory.mockResolvedValue({
+      ...payload,
+      totals: { ...payload.totals, lineage_omitted: 1203 },
+    })
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Session logs skipped')).toBeInTheDocument()
+    })
+    const value = screen.getByText('1,203')
+    expect(value).toBeInTheDocument()
+    // Informational, not an alarm: the unread logs change nothing on this page,
+    // so the count is not the page's warn colour. Its "?" hint leads with what
+    // the count means and what to check.
+    expect(value.className).not.toContain('text-warn')
+    expect(document.querySelector('[title*="Old session logs are piling up"]')).not.toBeNull()
+  })
+
+  it('says how many sessions are top-level once one nests under another', async () => {
+    // "Sessions 3" over a table that shows two top-level rows reads as a
+    // contradiction; the value reconciles the two counts only when they differ.
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Debugging session')).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/top-level/)).toBeNull()
+    cleanup()
+
+    mockSessionsMemory.mockResolvedValue(withLineage())
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Worker whose conductor closed')).toBeInTheDocument()
+    })
+    // Four sessions, one nested under its creator: three top-level.
+    expect(screen.getByText('4 (3 top-level)')).toBeInTheDocument()
+    // The hint spells out the decomposition so "Task sessions" beside it is not
+    // read as the other half of the sum.
+    expect(document.querySelector('[title*="1 nested under the session that opened them"]')).not.toBeNull()
   })
 })
 
