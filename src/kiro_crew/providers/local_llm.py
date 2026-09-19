@@ -1,6 +1,4 @@
-"""OpenAI-compatible provider — fork extension for KiroCrew.
-
-Connects KiroCrew to any OpenAI-compatible API endpoint:
+"""Connects KiroCrew to any OpenAI-compatible API endpoint:
   - LM Studio  (default: http://localhost:1234/v1)
   - Ollama     (http://localhost:11434/v1)
   - Any BYOK cloud endpoint (OpenAI, OpenRouter, DeepSeek, Anthropic via proxy)
@@ -19,7 +17,8 @@ Configuration in ~/.kiro/crew/.env:
 
 Key optimisation: Qwen3's /no_think system prompt directive reduces latency ~10x
 (39s → 4s per tool call) with no meaningful accuracy loss on tool dispatch tasks.
-Controlled by LOCAL_LLM_NO_THINK env var (default: true for local endpoints).
+Automatically enabled when the model name contains "qwen" (case-insensitive).
+Override with LOCAL_LLM_NO_THINK=true/false env var.
 
 This provider implements the LLMProvider ABC from providers/base.py.
 Only stream() is the critical path; the rest use safe defaults from the ABC.
@@ -50,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-_DEFAULT_BASE_URL = "http://localhost:1234/v1"  # LM Studio default   # LM Studio
+_DEFAULT_BASE_URL = "http://localhost:1234/v1"  # LM Studio default
 _DEFAULT_API_KEY  = "lm-studio"
 _DEFAULT_MODEL    = "qwen/qwen3-14b"
 
@@ -58,9 +57,29 @@ _DEFAULT_MODEL    = "qwen/qwen3-14b"
 # Benchmark: 96% tool-call success, 4.0s avg latency (vs ~39s with thinking on).
 _NO_THINK_DIRECTIVE = "/no_think"
 
+# Model families that support the /no_think directive.
+_NO_THINK_MODEL_PREFIXES = ("qwen",)
+
 
 def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
+
+
+def _should_inject_no_think(model: str, no_think_env: str) -> bool:
+    """Determine whether to inject /no_think based on model name.
+
+    Priority:
+      1. LOCAL_LLM_NO_THINK env var (explicit override always wins)
+      2. Model name — inject only for model families known to support it
+
+    This is more accurate than the previous URL-based check, which failed
+    for BYOK cloud endpoints running Qwen and injected for non-Qwen local models.
+    Fixes: https://github.com/obrutjack/jirou/issues/5
+    """
+    if no_think_env:
+        return no_think_env.lower() not in ("0", "false", "no")
+    model_lower = model.lower()
+    return any(prefix in model_lower for prefix in _NO_THINK_MODEL_PREFIXES)
 
 
 # ─── Provider ─────────────────────────────────────────────────────────────────
@@ -72,6 +91,19 @@ class LocalLLMProvider(LLMProvider):
     Drop-in replacement for AcpProvider when agent.provider = "local-llm".
     Streams text and tool-call events using the OpenAI streaming protocol and
     converts them to KiroCrew's internal LLMEvent format.
+
+    Architecture note on tool results
+    ----------------------------------
+    KiroCrew's turn loop calls provider.stream(message) once per user turn and
+    feeds tool results back as a new user message on the next stream() call.
+    This means tool results arrive as ordinary user messages, not as the
+    role:"tool" messages required by strict OpenAI endpoints.
+
+    The correct fix requires tracing how the KiroCrew gateway feeds tool results
+    to the provider and inserting a role:"tool" message at that point. Until
+    that is resolved, multi-step tool loops will work on lenient endpoints
+    (LM Studio) but may fail on strict endpoints (OpenAI, OpenRouter).
+    Tracked in: https://github.com/obrutjack/jirou/issues/4
     """
 
     def __init__(
@@ -88,15 +120,13 @@ class LocalLLMProvider(LLMProvider):
         self._model    = model    or _env("LOCAL_LLM_MODEL",     _DEFAULT_MODEL)
         self._session_key = session_key
 
-        # /no_think defaults to True for local endpoints (loopback), False for others.
+        # /no_think: use explicit override if provided, otherwise detect from model name.
         if no_think is not None:
             self._no_think = no_think
         else:
-            _raw = _env("LOCAL_LLM_NO_THINK", "")
-            if _raw:
-                self._no_think = _raw.lower() not in ("0", "false", "no")
-            else:
-                self._no_think = "localhost" in self._base_url or "127.0.0.1" in self._base_url
+            self._no_think = _should_inject_no_think(
+                self._model, _env("LOCAL_LLM_NO_THINK", "")
+            )
 
         self._client: AsyncOpenAI | None = None
         self._messages: list[dict] = []
@@ -136,87 +166,19 @@ class LocalLLMProvider(LLMProvider):
 
     # ── Core: stream ──────────────────────────────────────────────────────────
 
-    # Markers KiroCrew uses to wrap the user's actual request
-    _USER_REQUEST_MARKER = "[CURRENT USER REQUEST -- respond to this]"
-    _AGENT_PROMPT_END    = "[END AGENT SYSTEM PROMPT]"
-
-    # Max chars to keep from the injected context block (before the user request).
-    # ~2000 chars ≈ 500 tokens — enough for date/identity/critical rules,
-    # small enough to keep prefill fast on local hardware.
-    # Override with LOCAL_LLM_MAX_CONTEXT_CHARS env var.
-    _DEFAULT_MAX_CONTEXT_CHARS = 2_000
-
-    def _split_kirocrew_message(self, raw: str) -> tuple[str, str]:
-        """Split KiroCrew's injected context from the actual user request.
-
-        KiroCrew prepends ~60K chars of agent context to every user turn:
-          [AGENT SYSTEM PROMPT] ... [END AGENT SYSTEM PROMPT]
-          [SESSION CONTEXT] ... [END OF SESSION CONTEXT]
-          [CURRENT USER REQUEST -- respond to this]
-          <actual user question>
-
-        Returns (trimmed_context, actual_user_request).
-        If the marker is not found, returns ("", raw) — no trimming.
-        """
-        marker = self._USER_REQUEST_MARKER
-        idx = raw.find(marker)
-        if idx == -1:
-            return "", raw  # not a KiroCrew-format message, pass through unchanged
-
-        context_block = raw[:idx].strip()
-        user_request  = raw[idx + len(marker):].strip()
-
-        # Trim the context block to the configured max
-        max_chars = int(_env("LOCAL_LLM_MAX_CONTEXT_CHARS",
-                             str(self._DEFAULT_MAX_CONTEXT_CHARS)))
-        if len(context_block) > max_chars:
-            # Keep a tail — the most recent/relevant parts are usually at the end
-            trimmed = context_block[-max_chars:]
-            # Find first newline to avoid splitting mid-line
-            nl = trimmed.find("\n")
-            if nl != -1:
-                trimmed = trimmed[nl + 1:]
-            context_block = f"[context trimmed to last {max_chars} chars]\n{trimmed}"
-
-        return context_block, user_request
-
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         """Send a user message and yield KiroCrew LLMEvents."""
         if not self._client:
             await self.start()
 
-        # ── Extract actual user request from KiroCrew's injected context ─────
-        # KiroCrew bundles ~60K chars of agent context into the user message.
-        # We split it: trimmed context → appended to system message,
-        # actual question → user message. This keeps prefill small.
-        context_block, actual_request = self._split_kirocrew_message(message)
-
-        if context_block:
-            # Prepend trimmed context to the system message for this turn
-            sys_msg = self._messages[0] if self._messages else None
-            if sys_msg and sys_msg.get("role") == "system":
-                augmented_system = (
-                    sys_msg["content"]
-                    + f"\n\n[Injected context]\n{context_block}"
-                )
-                # Replace system message for this call only (don't persist)
-                messages_for_call = [
-                    {"role": "system", "content": augmented_system},
-                    *self._messages[1:],
-                    {"role": "user", "content": actual_request},
-                ]
-            else:
-                messages_for_call = [
-                    *self._messages,
-                    {"role": "user", "content": actual_request},
-                ]
-        else:
-            messages_for_call = [
-                *self._messages,
-                {"role": "user", "content": message},
-            ]
-
-        self._messages.append({"role": "user", "content": actual_request or message})
+        # Append user message and build the call payload.
+        # Note: KiroCrew injects ~60K chars of agent context into the user message.
+        # context_window_tokens() reports this provider's window size so KiroCrew
+        # scales down its injection at the source (budget ∝ window / 1,000,000).
+        # We do NOT post-hoc truncate here — see issues #6 and #3 for the
+        # investigation plan to verify source-side reduction is working.
+        self._messages.append({"role": "user", "content": message})
+        messages_for_call = list(self._messages)
 
         # ── Context size diagnostic ───────────────────────────────────────────
         total_chars = sum(
@@ -323,7 +285,6 @@ class LocalLLMProvider(LLMProvider):
 
         # Rough context usage estimate (characters as proxy for tokens)
         total_chars = sum(len(str(m)) for m in self._messages)
-        # Assume 128K token context window (conservative for local models)
         self._context_pct = min(100.0, (total_chars / (128_000 * 4)) * 100)
 
         yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
@@ -359,15 +320,18 @@ class LocalLLMProvider(LLMProvider):
         return self._model
 
     def context_window_tokens(self) -> int:
-        """Report the model's context window to KiroCrew so it scales down context injection.
+        """Report the model's context window so KiroCrew scales down context injection.
 
         KiroCrew's context budget is proportional to model_window / 1,000,000.
         For Qwen3 14B (32,768 token window):
           budget = 165,000 × 32,768 / 1,000,000 ≈ 5,400 chars
         vs the 1M-model default of 165,000 chars (~55K tokens).
 
+        This is the source-side reduction mechanism. Whether KiroCrew actually
+        reads this value to reduce injection is under investigation — see issue #6.
+
         Override via LOCAL_LLM_CONTEXT_WINDOW env var (default: 32768).
-        Set to 0 to fall back to KiroCrew's 1M-model default (not recommended for local).
+        Set to 0 to fall back to KiroCrew's 1M-model default (not recommended).
         """
         raw = _env("LOCAL_LLM_CONTEXT_WINDOW", "32768")
         try:
@@ -381,28 +345,15 @@ class LocalLLMProvider(LLMProvider):
         """Build the system prompt for local LLM inference.
 
         Priority order:
-          1. LOCAL_LLM_SYSTEM_PROMPT env var — user's custom prompt (shortest path)
+          1. LOCAL_LLM_SYSTEM_PROMPT env var — user's custom prompt
           2. Default concise prompt — works well with Qwen3 and /no_think
-
-        The KiroCrew gateway injects its own large system prompt (~14K tokens)
-        on top of this via its session context layer.  That injected block is
-        what causes slow prefill on local hardware.
-
-        To bypass that overhead, set LOCAL_LLM_SYSTEM_PROMPT to a short
-        instruction -- this provider's system message is the ONLY message sent
-        before the user turn, not the gateway's context block.
-
-        Note: the gateway context block is injected by KiroCrew's session layer
-        separately; this method only controls the provider's own system message.
         """
-        # Allow full override via env var — useful for minimising prefill cost
         custom = _env("LOCAL_LLM_SYSTEM_PROMPT", "")
         if custom:
             if self._no_think and not custom.startswith(_NO_THINK_DIRECTIVE):
                 return f"{_NO_THINK_DIRECTIVE}\n{custom}"
             return custom
 
-        # Default: concise but capable
         base = (
             "You are a precise AI agent with access to tools. "
             "Call tools directly to complete the user's task. "
@@ -412,15 +363,3 @@ class LocalLLMProvider(LLMProvider):
         if self._no_think:
             return f"{_NO_THINK_DIRECTIVE}\n{base}"
         return base
-
-    def inject_tool_result(self, tool_call_id: str, result: str) -> None:
-        """Append a tool result to the conversation history.
-
-        Called by KiroCrew's session layer after executing a tool call that
-        was yielded as an EVENT_TOOL_CALL event.
-        """
-        self._messages.append({
-            "role":         "tool",
-            "tool_call_id": tool_call_id,
-            "content":      result,
-        })
