@@ -13,7 +13,7 @@ OpenAI-compatible API endpoint — most commonly **LM Studio** running **Qwen3 1
 | Component | Location | Description |
 |---|---|---|
 | `providers/openai_compatible.py` | New file | LLMProvider implementation for local models |
-| `config/sections.py` | +1 line | Adds `"openai-compatible"` to provider enum |
+| `config/sections.py` | +1 line | Adds `"local-llm"` to provider enum |
 | `config/loader.py` | +12 lines | Routes to new provider when configured |
 
 ---
@@ -59,7 +59,7 @@ Our context splitting code ensures we never exceed 4096 tokens, so 4096 is safe.
 
 In LM Studio → Local Server → Load Qwen3 14B → Start Server
 
-Default port: `1234` (matches our default `OPENAI_COMPAT_BASE_URL`)
+Default port: `1234` (matches our default `LOCAL_LLM_BASE_URL`)
 
 ---
 
@@ -85,7 +85,7 @@ Create `~/.kiro/jirou/config.json`:
 ```json
 {
   "agent": {
-    "provider": "openai-compatible",
+    "provider": "local-llm",
     "approval_mode": "auto",
     "sandbox": "off",
     "tool_search": false,
@@ -99,13 +99,13 @@ Create `~/.kiro/jirou/config.json`:
 
 Create `~/.kiro/jirou/.env`:
 ```
-OPENAI_COMPAT_BASE_URL=http://localhost:1234/v1
-OPENAI_COMPAT_API_KEY=lm-studio
-OPENAI_COMPAT_MODEL=qwen/qwen3-14b
-OPENAI_COMPAT_NO_THINK=true
-OPENAI_COMPAT_CONTEXT_WINDOW=4096
-OPENAI_COMPAT_MAX_CONTEXT_CHARS=2000
-OPENAI_COMPAT_SYSTEM_PROMPT=You are a helpful local AI assistant. Answer concisely. Use the available tools when needed to complete the user's request.
+LOCAL_LLM_BASE_URL=http://localhost:1234/v1
+LOCAL_LLM_API_KEY=lm-studio
+LOCAL_LLM_MODEL=qwen/qwen3-14b
+LOCAL_LLM_NO_THINK=true
+LOCAL_LLM_CONTEXT_WINDOW=4096
+LOCAL_LLM_MAX_CONTEXT_CHARS=2000
+LOCAL_LLM_SYSTEM_PROMPT=You are a helpful local AI assistant. Answer concisely. Use the available tools when needed to complete the user's request.
 ```
 
 ### Step 3: Build the frontend
@@ -163,8 +163,8 @@ edits to existing files to reduce merge conflicts.
 | Setting | Value | Impact |
 |---------|-------|--------|
 | LM Studio context length | **4096** | Most important — prefill 10x faster than 32768 |
-| OPENAI_COMPAT_MAX_CONTEXT_CHARS | 2000 | Trims KiroCrew's injected context to ~500 tokens |
-| OPENAI_COMPAT_NO_THINK | true | Disables Qwen3 thinking mode (10x generation speedup) |
+| LOCAL_LLM_MAX_CONTEXT_CHARS | 2000 | Trims KiroCrew's injected context to ~500 tokens |
+| LOCAL_LLM_NO_THINK | true | Disables Qwen3 thinking mode (10x generation speedup) |
 | tool_search | false | Removes skills index from injected context |
 
 ---
@@ -173,10 +173,10 @@ edits to existing files to reduce merge conflicts.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAI_COMPAT_BASE_URL` | `http://localhost:1234/v1` | LM Studio / Ollama endpoint |
-| `OPENAI_COMPAT_API_KEY` | `lm-studio` | API key (any string for local) |
-| `OPENAI_COMPAT_MODEL` | `qwen/qwen3-14b` | Model identifier |
-| `OPENAI_COMPAT_NO_THINK` | `true` | Inject `/no_think` to disable Qwen3 thinking mode |
-| `OPENAI_COMPAT_CONTEXT_WINDOW` | `32768` | Report to KiroCrew for context budget scaling |
-| `OPENAI_COMPAT_MAX_CONTEXT_CHARS` | `2000` | Max chars to keep from KiroCrew's injected context |
-| `OPENAI_COMPAT_SYSTEM_PROMPT` | (built-in) | Override system prompt entirely |
+| `LOCAL_LLM_BASE_URL` | `http://localhost:1234/v1` | LM Studio / Ollama endpoint |
+| `LOCAL_LLM_API_KEY` | `lm-studio` | API key (any string for local) |
+| `LOCAL_LLM_MODEL` | `qwen/qwen3-14b` | Model identifier |
+| `LOCAL_LLM_NO_THINK` | `true` | Inject `/no_think` to disable Qwen3 thinking mode |
+| `LOCAL_LLM_CONTEXT_WINDOW` | `32768` | Report to KiroCrew for context budget scaling |
+| `LOCAL_LLM_MAX_CONTEXT_CHARS` | `2000` | Max chars to keep from KiroCrew's injected context |
+| `LOCAL_LLM_SYSTEM_PROMPT` | (built-in) | Override system prompt entirely |

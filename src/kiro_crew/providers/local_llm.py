@@ -8,18 +8,18 @@ Connects KiroCrew to any OpenAI-compatible API endpoint:
 Configuration in ~/.kiro/crew/config.json:
     {
       "agent": {
-        "provider": "openai-compatible"
+        "provider": "local-llm"
       }
     }
 
 Configuration in ~/.kiro/crew/.env:
-    OPENAI_COMPAT_BASE_URL=http://localhost:1234/v1
-    OPENAI_COMPAT_API_KEY=lm-studio
-    OPENAI_COMPAT_MODEL=qwen/qwen3-14b
+    LOCAL_LLM_BASE_URL=http://localhost:1234/v1
+    LOCAL_LLM_API_KEY=lm-studio
+    LOCAL_LLM_MODEL=qwen/qwen3-14b
 
 Key optimisation: Qwen3's /no_think system prompt directive reduces latency ~10x
 (39s → 4s per tool call) with no meaningful accuracy loss on tool dispatch tasks.
-Controlled by OPENAI_COMPAT_NO_THINK env var (default: true for local endpoints).
+Controlled by LOCAL_LLM_NO_THINK env var (default: true for local endpoints).
 
 This provider implements the LLMProvider ABC from providers/base.py.
 Only stream() is the critical path; the rest use safe defaults from the ABC.
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-_DEFAULT_BASE_URL = "http://localhost:1234/v1"   # LM Studio
+_DEFAULT_BASE_URL = "http://localhost:1234/v1"  # LM Studio default   # LM Studio
 _DEFAULT_API_KEY  = "lm-studio"
 _DEFAULT_MODEL    = "qwen/qwen3-14b"
 
@@ -66,10 +66,10 @@ def _env(key: str, default: str) -> str:
 # ─── Provider ─────────────────────────────────────────────────────────────────
 
 
-class OpenAICompatibleProvider(LLMProvider):
+class LocalLLMProvider(LLMProvider):
     """LLMProvider backed by any OpenAI-compatible HTTP API.
 
-    Drop-in replacement for AcpProvider when agent.provider = "openai-compatible".
+    Drop-in replacement for AcpProvider when agent.provider = "local-llm".
     Streams text and tool-call events using the OpenAI streaming protocol and
     converts them to KiroCrew's internal LLMEvent format.
     """
@@ -83,16 +83,16 @@ class OpenAICompatibleProvider(LLMProvider):
         session_key: str | None = None,
         **_kwargs: Any,
     ) -> None:
-        self._base_url = base_url or _env("OPENAI_COMPAT_BASE_URL", _DEFAULT_BASE_URL)
-        self._api_key  = api_key  or _env("OPENAI_COMPAT_API_KEY",  _DEFAULT_API_KEY)
-        self._model    = model    or _env("OPENAI_COMPAT_MODEL",     _DEFAULT_MODEL)
+        self._base_url = base_url or _env("LOCAL_LLM_BASE_URL", _DEFAULT_BASE_URL)
+        self._api_key  = api_key  or _env("LOCAL_LLM_API_KEY",  _DEFAULT_API_KEY)
+        self._model    = model    or _env("LOCAL_LLM_MODEL",     _DEFAULT_MODEL)
         self._session_key = session_key
 
         # /no_think defaults to True for local endpoints (loopback), False for others.
         if no_think is not None:
             self._no_think = no_think
         else:
-            _raw = _env("OPENAI_COMPAT_NO_THINK", "")
+            _raw = _env("LOCAL_LLM_NO_THINK", "")
             if _raw:
                 self._no_think = _raw.lower() not in ("0", "false", "no")
             else:
@@ -104,7 +104,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self._pending_tool_approvals: set = set()
 
         logger.info(
-            "[OpenAICompat] provider initialised: model=%s base_url=%s no_think=%s",
+            "[LocalLLM] provider initialised: model=%s base_url=%s no_think=%s",
             self._model, self._base_url, self._no_think,
         )
 
@@ -122,9 +122,9 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             models = await self._client.models.list()
             names  = [m.id for m in models.data]
-            logger.info("[OpenAICompat] connected; available models: %s", names[:5])
+            logger.info("[LocalLLM] connected; available models: %s", names[:5])
         except APIConnectionError as e:
-            logger.warning("[OpenAICompat] connectivity check failed: %s", e)
+            logger.warning("[LocalLLM] connectivity check failed: %s", e)
             # Non-fatal: the user may start the server after KiroCrew boots.
 
     async def shutdown(self) -> None:
@@ -143,7 +143,7 @@ class OpenAICompatibleProvider(LLMProvider):
     # Max chars to keep from the injected context block (before the user request).
     # ~2000 chars ≈ 500 tokens — enough for date/identity/critical rules,
     # small enough to keep prefill fast on local hardware.
-    # Override with OPENAI_COMPAT_MAX_CONTEXT_CHARS env var.
+    # Override with LOCAL_LLM_MAX_CONTEXT_CHARS env var.
     _DEFAULT_MAX_CONTEXT_CHARS = 2_000
 
     def _split_kirocrew_message(self, raw: str) -> tuple[str, str]:
@@ -167,7 +167,7 @@ class OpenAICompatibleProvider(LLMProvider):
         user_request  = raw[idx + len(marker):].strip()
 
         # Trim the context block to the configured max
-        max_chars = int(_env("OPENAI_COMPAT_MAX_CONTEXT_CHARS",
+        max_chars = int(_env("LOCAL_LLM_MAX_CONTEXT_CHARS",
                              str(self._DEFAULT_MAX_CONTEXT_CHARS)))
         if len(context_block) > max_chars:
             # Keep a tail — the most recent/relevant parts are usually at the end
@@ -225,13 +225,13 @@ class OpenAICompatibleProvider(LLMProvider):
         )
         estimated_tokens = total_chars // 4
         logger.warning(
-            "[OpenAICompat] 📊 Prompt stats: %d messages, ~%d chars, ~%d tokens (estimated) | model=%s",
+            "[LocalLLM] 📊 Prompt stats: %d messages, ~%d chars, ~%d tokens (estimated) | model=%s",
             len(messages_for_call), total_chars, estimated_tokens, self._model,
         )
         for i, m in enumerate(messages_for_call):
             c = str(m.get("content") or "")
             logger.warning(
-                "[OpenAICompat]   msg[%d] role=%s chars=%d (first 80: %r)",
+                "[LocalLLM]   msg[%d] role=%s chars=%d (first 80: %r)",
                 i, m.get("role"), len(c), c[:80],
             )
 
@@ -249,14 +249,14 @@ class OpenAICompatibleProvider(LLMProvider):
             ) as stream:
                 _stream_open_time = time.monotonic() - _t0
                 logger.warning(
-                    "[OpenAICompat] ⏱ stream opened in %.2fs",
+                    "[LocalLLM] ⏱ stream opened in %.2fs",
                     _stream_open_time,
                 )
                 async for chunk in stream:
                     if _first_token_time is None:
                         _first_token_time = time.monotonic() - _t0
                         logger.warning(
-                            "[OpenAICompat] ⏱ first token in %.2fs (prefill + TTFT)",
+                            "[LocalLLM] ⏱ first token in %.2fs (prefill + TTFT)",
                             _first_token_time,
                         )
                     delta = chunk.choices[0].delta if chunk.choices else None
@@ -293,11 +293,11 @@ class OpenAICompatibleProvider(LLMProvider):
                         break
 
         except APIConnectionError as e:
-            logger.error("[OpenAICompat] connection error during stream: %s", e)
+            logger.error("[LocalLLM] connection error during stream: %s", e)
             yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="error")
             return
         except APIError as e:
-            logger.error("[OpenAICompat] API error during stream: %s", e)
+            logger.error("[LocalLLM] API error during stream: %s", e)
             yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="error")
             return
 
@@ -352,7 +352,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
     @property
     def context_provider_type(self) -> str:
-        return "openai-compatible"
+        return "local-llm"
 
     @property
     def served_model(self) -> str:
@@ -366,10 +366,10 @@ class OpenAICompatibleProvider(LLMProvider):
           budget = 165,000 × 32,768 / 1,000,000 ≈ 5,400 chars
         vs the 1M-model default of 165,000 chars (~55K tokens).
 
-        Override via OPENAI_COMPAT_CONTEXT_WINDOW env var (default: 32768).
+        Override via LOCAL_LLM_CONTEXT_WINDOW env var (default: 32768).
         Set to 0 to fall back to KiroCrew's 1M-model default (not recommended for local).
         """
-        raw = _env("OPENAI_COMPAT_CONTEXT_WINDOW", "32768")
+        raw = _env("LOCAL_LLM_CONTEXT_WINDOW", "32768")
         try:
             return int(raw)
         except ValueError:
@@ -381,14 +381,14 @@ class OpenAICompatibleProvider(LLMProvider):
         """Build the system prompt for local LLM inference.
 
         Priority order:
-          1. OPENAI_COMPAT_SYSTEM_PROMPT env var — user's custom prompt (shortest path)
+          1. LOCAL_LLM_SYSTEM_PROMPT env var — user's custom prompt (shortest path)
           2. Default concise prompt — works well with Qwen3 and /no_think
 
         The KiroCrew gateway injects its own large system prompt (~14K tokens)
         on top of this via its session context layer.  That injected block is
         what causes slow prefill on local hardware.
 
-        To bypass that overhead, set OPENAI_COMPAT_SYSTEM_PROMPT to a short
+        To bypass that overhead, set LOCAL_LLM_SYSTEM_PROMPT to a short
         instruction -- this provider's system message is the ONLY message sent
         before the user turn, not the gateway's context block.
 
@@ -396,7 +396,7 @@ class OpenAICompatibleProvider(LLMProvider):
         separately; this method only controls the provider's own system message.
         """
         # Allow full override via env var — useful for minimising prefill cost
-        custom = _env("OPENAI_COMPAT_SYSTEM_PROMPT", "")
+        custom = _env("LOCAL_LLM_SYSTEM_PROMPT", "")
         if custom:
             if self._no_think and not custom.startswith(_NO_THINK_DIRECTIVE):
                 return f"{_NO_THINK_DIRECTIVE}\n{custom}"

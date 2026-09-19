@@ -911,7 +911,7 @@ class AgentConfig:
     )
     provider: str = field(
         default="acp",
-        metadata=_meta("Provider", "LLM provider backend. \"acp\" = kiro-cli (default); \"openai-compatible\" = any OpenAI-compatible endpoint (LM Studio, Ollama, BYOK).", enum=["acp", "openai-compatible"]),
+        metadata=_meta("Provider", "LLM provider backend. \"acp\" = kiro-cli (default); \"openai-compatible\" = any OpenAI-compatible endpoint (LM Studio, Ollama, BYOK).", enum=["acp", "local-llm"]),
     )
     mcp_registry_mode: bool = field(
         default=False,
