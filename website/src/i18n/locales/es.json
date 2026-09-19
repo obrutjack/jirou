@@ -8418,7 +8418,9 @@
       "uncommitted": "{{count}} sin confirmar",
       "branch_unavailable": "Rama no disponible",
       "status_failed": "No se pudo leer el estado del repositorio. El historial de commits puede estar desactualizado.",
-      "log_failed": "No se pudo leer el historial de commits."
+      "log_failed": "No se pudo leer el historial de commits.",
+      "uncommitted_capped": "más de {{count}} sin confirmar",
+      "showing_first": "mostrando los primeros {{count}}"
     },
     "workspaceTree": {
       "status_failed": "No se pudo leer el estado del repositorio."

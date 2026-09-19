@@ -8304,7 +8304,9 @@
       "uncommitted": "{{count}}টি আনকমিটেড",
       "branch_unavailable": "ব্রাঞ্চ পাওয়া যাচ্ছে না",
       "status_failed": "রিপোজিটরির অবস্থা পড়া যায়নি। কমিট ইতিহাসটি পুরোনো হতে পারে।",
-      "log_failed": "কমিট লগ পড়া যায়নি।"
+      "log_failed": "কমিট লগ পড়া যায়নি।",
+      "uncommitted_capped": "{{count}}টির বেশি আনকমিটেড",
+      "showing_first": "প্রথম {{count}}টি দেখানো হচ্ছে"
     },
     "workspaceTree": {
       "status_failed": "রিপোজিটরির অবস্থা পড়া যায়নি।"

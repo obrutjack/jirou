@@ -8418,7 +8418,9 @@
       "uncommitted": "{{count}} non committati",
       "branch_unavailable": "Branch non disponibile",
       "status_failed": "Impossibile leggere lo stato del repository. La cronologia dei commit potrebbe non essere aggiornata.",
-      "log_failed": "Impossibile leggere la cronologia dei commit."
+      "log_failed": "Impossibile leggere la cronologia dei commit.",
+      "uncommitted_capped": "oltre {{count}} non committati",
+      "showing_first": "mostrati i primi {{count}}"
     },
     "workspaceTree": {
       "status_failed": "Impossibile leggere lo stato del repository."

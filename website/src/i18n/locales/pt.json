@@ -8418,7 +8418,9 @@
       "uncommitted": "{{count}} sem commit",
       "branch_unavailable": "Branch indisponível",
       "status_failed": "Não foi possível ler o estado do repositório. O histórico de commits pode estar desatualizado.",
-      "log_failed": "Não foi possível ler o histórico de commits."
+      "log_failed": "Não foi possível ler o histórico de commits.",
+      "uncommitted_capped": "mais de {{count}} sem commit",
+      "showing_first": "mostrando os primeiros {{count}}"
     },
     "workspaceTree": {
       "status_failed": "Não foi possível ler o estado do repositório."

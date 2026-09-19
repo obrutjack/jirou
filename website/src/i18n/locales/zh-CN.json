@@ -8190,7 +8190,9 @@
       "uncommitted": "{{count}} 个未提交",
       "branch_unavailable": "分支不可用",
       "status_failed": "无法读取仓库状态。提交历史可能已过时。",
-      "log_failed": "无法读取提交记录。"
+      "log_failed": "无法读取提交记录。",
+      "uncommitted_capped": "超过 {{count}} 个未提交",
+      "showing_first": "仅显示前 {{count}} 个"
     },
     "workspaceTree": {
       "status_failed": "无法读取仓库状态。"

@@ -3082,7 +3082,9 @@
       "not_a_repository": "Not a Git repository",
       "not_a_repository_help": "This project folder is not a Git repository. If the repository is in a subfolder, click the folder name below the message box.",
       "status_failed": "Couldn’t read the repository status. Commit history may be out of date.",
-      "log_failed": "Couldn’t read the commit log."
+      "log_failed": "Couldn’t read the commit log.",
+      "uncommitted_capped": "{{count}}+ uncommitted",
+      "showing_first": "showing first {{count}}"
     },
     "workspaceTree": {
       "status_failed": "Couldn’t read the repository status."

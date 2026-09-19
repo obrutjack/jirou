@@ -215,3 +215,52 @@ describe('GitPanel repository state', () => {
     expect(screen.queryByText('Not a Git repository')).toBeNull()
   })
 })
+
+describe('GitPanel capped listing', () => {
+  const capped = (n: number, truncated: boolean) => ({
+    repo: true,
+    repoRoot: PROJECT,
+    branch: 'main',
+    truncated,
+    files: Array.from({ length: n }, (_, i) => ({
+      path: `src/f${i}.ts`,
+      status: 'M',
+      staged: false,
+    })),
+  })
+
+  it('says the listing was cut short instead of reporting the cap as the total', async () => {
+    H.api.projectGitStatus.mockResolvedValue(capped(500, true))
+
+    mount()
+
+    expect(await screen.findByTestId('git-panel-truncated')).toHaveTextContent('showing first 500')
+    // The pill must not read a bare "500 uncommitted": that is the cap, and the
+    // real number is larger by an unknown amount.
+    expect(screen.getByText('500+ uncommitted')).toBeInTheDocument()
+    expect(screen.queryByText('500 uncommitted')).toBeNull()
+    expect(screen.queryByText('clean')).toBeNull()
+  })
+
+  it('leaves a complete listing unqualified', async () => {
+    H.api.projectGitStatus.mockResolvedValue(capped(500, false))
+
+    mount()
+
+    expect(await screen.findByText('500 uncommitted')).toBeInTheDocument()
+    expect(screen.queryByTestId('git-panel-truncated')).toBeNull()
+    expect(screen.queryByText('500+ uncommitted')).toBeNull()
+  })
+
+  it('does not qualify a listing when the status read failed', async () => {
+    // truncated cannot be trusted from a body the caller never received; a
+    // rejected read must reach the error state, not a capped-list warning.
+    H.api.projectGitStatus.mockRejectedValue(new Error('status unavailable'))
+
+    mount()
+
+    expect(await screen.findByTestId('git-panel-status-error', {}, { timeout: 5000 })).toBeInTheDocument()
+    expect(screen.queryByTestId('git-panel-truncated')).toBeNull()
+    expect(screen.queryByText('clean')).toBeNull()
+  })
+})

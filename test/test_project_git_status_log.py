@@ -833,10 +833,15 @@ class TestGitLog:
 
 
 class TestFilterDriverRefusal:
-    """A repo whose own config names a content-filter driver gets a degraded
-    empty answer: status re-hashes modified files through ``filter.<n>.clean``,
+    """A repo whose own config names a content-filter driver is reported as
+    UNAVAILABLE: status re-hashes modified files through ``filter.<n>.clean``,
     so running any content-touching git against such a repo would execute a
-    repository-supplied program on every poll."""
+    repository-supplied program on every poll.
+
+    The refusal must not be spelled as an empty result. ``{"repo": true,
+    "files": []}`` is what a genuinely clean repository returns, so a refusal
+    wearing that shape makes the panel draw its green "clean" pill over a
+    working tree it has never read."""
 
     @pytest.mark.asyncio
     async def test_status_refuses_clean_filter(self, repo, mock_sel):
@@ -845,13 +850,60 @@ class TestFilterDriverRefusal:
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.get(f"/api/project/git/status?path={repo}")
             data = await resp.json()
-        assert data["repo"] is True
-        assert data["files"] == []
+        assert resp.status == 503
+        assert data["code"] == "git_status_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_status_filter_refusal_is_distinguishable_from_a_clean_repo(
+        self, repo, tmp_path, mock_sel
+    ):
+        """The reported defect, asserted as the property that was violated.
+
+        A caller cannot tell "we declined to read this repo" from "this repo
+        has no changes" while both answers are the same bytes. Comparing
+        the two responses directly is what keeps any future spelling of the
+        refusal from collapsing back onto the clean answer -- an assertion on
+        one literal body would not.
+        """
+        clean = tmp_path / "clean"
+        shutil.copytree(repo, clean)
+        async with TestClient(TestServer(_make_app(str(clean)))) as client:
+            clean_resp = await client.get(f"/api/project/git/status?path={clean}")
+            clean_body = await clean_resp.json()
+
+        _git(repo, "config", "filter.evil.clean", "touch /tmp/pwned")
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            refused_resp = await client.get(f"/api/project/git/status?path={repo}")
+            refused_body = await refused_resp.json()
+
+        # The clean control must really be the healthy answer, or the
+        # comparison below could pass with both sides degraded.
+        assert clean_resp.status == 200
+        assert clean_body["repo"] is True
+        assert clean_body["files"] == []
+
+        assert refused_resp.status != clean_resp.status
+        assert refused_body != clean_body
 
     @pytest.mark.asyncio
     async def test_status_checks_corrupt_head_before_filter_refusal(
-        self, repo, mock_sel
+        self, repo, mock_sel, monkeypatch
     ):
+        """HEAD is probed before the filter guard.
+
+        Both answers are the same 503, so the response body cannot witness the
+        ordering; the guard never being reached is what does.
+        """
+        import kiro_crew.dashboard.handlers.files as files_mod
+
+        called = False
+
+        def _spy(*args, **kwargs):
+            nonlocal called
+            called = True
+            return False
+
+        monkeypatch.setattr(files_mod, "_repo_declares_filter_driver", _spy)
         _git(repo, "config", "filter.evil.clean", "touch /tmp/pwned")
         (repo / ".git" / "HEAD").write_text("ref: refs/heads/bad.lock\n")
 
@@ -861,6 +913,7 @@ class TestFilterDriverRefusal:
 
         assert resp.status == 503
         assert data["code"] == "git_status_unavailable"
+        assert called is False
 
     @pytest.mark.asyncio
     async def test_log_refuses_process_filter(self, repo, mock_sel):
@@ -868,8 +921,34 @@ class TestFilterDriverRefusal:
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.get(f"/api/project/git/log?path={repo}")
             data = await resp.json()
-        assert data["repo"] is True
-        assert data["commits"] == []
+        assert resp.status == 503
+        assert data["code"] == "git_log_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_log_filter_refusal_is_distinguishable_from_an_unborn_repo(
+        self, repo, tmp_path, mock_sel
+    ):
+        """An empty commit list is what a repo with no commits legitimately
+        returns, so the refusal must not be spelled that way either."""
+        unborn = tmp_path / "unborn"
+        unborn.mkdir()
+        _git(unborn, "init", "-q", "-b", "trunk")
+        async with TestClient(TestServer(_make_app(str(unborn)))) as client:
+            unborn_resp = await client.get(f"/api/project/git/log?path={unborn}")
+            unborn_body = await unborn_resp.json()
+
+        _git(repo, "config", "filter.evil.process", "evil-daemon")
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            refused_resp = await client.get(f"/api/project/git/log?path={repo}")
+            refused_body = await refused_resp.json()
+
+        # A repo with no commits still answers 200 with an empty list: that
+        # state is legitimate and must NOT have been converted into an error.
+        assert unborn_resp.status == 200
+        assert unborn_body["commits"] == []
+
+        assert refused_resp.status != unborn_resp.status
+        assert refused_body != unborn_body
 
     @pytest.mark.asyncio
     async def test_clean_repo_is_not_refused(self, repo, mock_sel):
@@ -878,6 +957,7 @@ class TestFilterDriverRefusal:
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.get(f"/api/project/git/status?path={repo}")
             data = await resp.json()
+        assert resp.status == 200
         assert data["repo"] is True
 
 
@@ -1077,3 +1157,48 @@ class TestVanishedDirectory:
             data = await resp.json()
         assert data["repo"] is False
         assert data["files"] == []
+
+
+class TestListingCap:
+    """The response caps the file listing at 500 and says when it did.
+
+    Unless the flag reaches the caller, the cap reads as the total: a repo with
+    900 changed files shows 500 and its list simply ends, which presents an
+    undercount as a count.
+    """
+
+    @staticmethod
+    def _add_untracked(repo, count: int) -> None:
+        for i in range(count):
+            (repo / f"f{i:04d}.txt").write_text("x\n")
+
+    @pytest.mark.asyncio
+    async def test_a_capped_listing_says_it_was_capped(self, repo, mock_sel):
+        self._add_untracked(repo, 501)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+        assert resp.status == 200
+        assert len(data["files"]) == 500
+        assert data["truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_listing_at_the_cap_is_not_marked_capped(self, repo, mock_sel):
+        """Exactly 500 is complete: an off-by-one here would warn on a listing
+        that is in fact whole, which trains the reader to ignore the warning."""
+        self._add_untracked(repo, 500)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+        assert resp.status == 200
+        assert len(data["files"]) == 500
+        assert "truncated" not in data
+
+    @pytest.mark.asyncio
+    async def test_a_clean_repo_is_not_marked_capped(self, repo, mock_sel):
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+        assert resp.status == 200
+        assert data["files"] == []
+        assert "truncated" not in data

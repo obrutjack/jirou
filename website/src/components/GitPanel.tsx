@@ -103,6 +103,11 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
   const noRepository = !statusError && status?.repo === false
   const hasNoChanges = fileCount === 0
   const isClean = !statusError && isRepository && hasNoChanges
+  // The server caps the listing and says so. Unless the panel reads that flag
+  // the cap reads as the total, so a repo with 900 changed files shows "500
+  // uncommitted" and its list simply ends -- an undercount presented as a
+  // count.
+  const listTruncated = !statusError && isRepository && status?.truncated === true
   const statusErrorMessage = errMessage(statusError)
   const statusUnavailable = apiErrorCode(statusError) === 'git_status_unavailable'
   const localizedStatusFailure = i18nT('components.gitPanel.status_failed')
@@ -148,7 +153,9 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
                 ? '...'
                 : hasNoChanges
                   ? i18nT('components.gitPanel.clean')
-                  : i18nT('components.gitPanel.uncommitted', { count: fileCount })}
+                  : listTruncated
+                    ? i18nT('components.gitPanel.uncommitted_capped', { count: fileCount })
+                    : i18nT('components.gitPanel.uncommitted', { count: fileCount })}
             </span>
           )}
 
@@ -201,6 +208,11 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
                 {i18nT('components.gitPanel.changes')}
               </span>
               <span className="text-[10px] text-muted">{fileCount}</span>
+              {listTruncated && (
+                <span role="status" className="text-[10px] text-warn" data-testid="git-panel-truncated">
+                  {i18nT('components.gitPanel.showing_first', { count: fileCount })}
+                </span>
+              )}
             </div>
             <div>
               {status?.files.map(f => (

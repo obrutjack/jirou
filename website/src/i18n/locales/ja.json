@@ -8190,7 +8190,9 @@
       "uncommitted": "{{count}} 件の未コミット",
       "branch_unavailable": "ブランチを利用できません",
       "status_failed": "リポジトリの状態を読み取れませんでした。コミット履歴が古い可能性があります。",
-      "log_failed": "コミットログを読み取れませんでした。"
+      "log_failed": "コミットログを読み取れませんでした。",
+      "uncommitted_capped": "{{count}} 件以上の未コミット",
+      "showing_first": "先頭 {{count}} 件を表示中"
     },
     "workspaceTree": {
       "status_failed": "リポジトリの状態を読み取れませんでした。"

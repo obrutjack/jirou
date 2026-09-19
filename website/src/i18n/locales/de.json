@@ -8304,7 +8304,9 @@
       "uncommitted": "{{count}} nicht committet",
       "branch_unavailable": "Branch nicht verfügbar",
       "status_failed": "Der Repository-Status konnte nicht gelesen werden. Der Commit-Verlauf ist möglicherweise veraltet.",
-      "log_failed": "Das Commit-Protokoll konnte nicht gelesen werden."
+      "log_failed": "Das Commit-Protokoll konnte nicht gelesen werden.",
+      "uncommitted_capped": "über {{count}} nicht committet",
+      "showing_first": "erste {{count}} werden angezeigt"
     },
     "workspaceTree": {
       "status_failed": "Der Repository-Status konnte nicht gelesen werden."

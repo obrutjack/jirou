@@ -8418,7 +8418,9 @@
       "uncommitted": "{{count}} non validé(s)",
       "branch_unavailable": "Branche indisponible",
       "status_failed": "Impossible de lire l’état du dépôt. L’historique des commits peut être obsolète.",
-      "log_failed": "Impossible de lire l’historique des commits."
+      "log_failed": "Impossible de lire l’historique des commits.",
+      "uncommitted_capped": "plus de {{count}} non validé(s)",
+      "showing_first": "affichage des {{count}} premiers"
     },
     "workspaceTree": {
       "status_failed": "Impossible de lire l’état du dépôt."

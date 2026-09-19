@@ -7439,9 +7439,20 @@ async def api_project_git_status(request: web.Request) -> web.Response:
 
         # Refuse repos whose own config names a content-filter driver: status
         # re-hashes modified files through ``filter.<name>.clean``, which would
-        # execute that program on every 5s poll. Degraded-but-safe empty answer.
+        # execute that program on every 5s poll.
+        #
+        # The refusal reports UNAVAILABLE, never an empty file list.
+        # ``{"repo": True, "files": []}`` is what a genuinely clean repository
+        # returns, so a refusal wearing that shape is indistinguishable from
+        # health: the panel draws its green "clean" pill over a working tree it
+        # holds no status for, on any repo configured by ``git lfs install
+        # --local``, on every poll. A panel whose one job is surfacing
+        # uncommitted changes is more wrong when it claims none than when it
+        # admits it has no answer. ``_repo_declares_filter_driver`` is also True
+        # when its own config probe cannot prove a driver absent, and that state
+        # is likewise unknown rather than clean.
         if _repo_declares_filter_driver(_git_cmd, base, _env):
-            return {"repo": True, "files": []}
+            return {"_status_unavailable": True}
 
         # Get repo root and branch info
         root_rc, root_out, _ = _run_git_bounded(
@@ -7985,9 +7996,12 @@ async def api_project_git_log(request: web.Request) -> web.Response:
         # Same filter-driver refusal as the status handler (defense in depth:
         # ``git log`` does not run clean filters, but one uniform invariant --
         # no git subcommand runs against a repo that names a driver -- is
-        # auditable; per-subcommand carve-outs are not).
+        # auditable; per-subcommand carve-outs are not). Reported as
+        # unavailable for the same reason status is: an empty commit list is
+        # what a brand-new repository legitimately returns, so a refusal
+        # spelled that way is indistinguishable from "no history yet".
         if _repo_declares_filter_driver(_git_cmd, base, _env):
-            return {"repo": True, "commits": []}
+            return {"_log_unavailable": True}
 
         # Get HEAD sha for isHead marking
         head_rc, head_out, _ = _run_git_bounded(
@@ -8021,6 +8035,14 @@ async def api_project_git_log(request: web.Request) -> web.Response:
         return {"repo": True, "commits": commits}
 
     result = await asyncio.to_thread(_run)
+    if result.pop("_log_unavailable", False):
+        return web.json_response(
+            {
+                "error": "Couldn't read the repository history.",
+                "code": "git_log_unavailable",
+            },
+            status=503,
+        )
     # Egress redaction: commit subjects and author names are repo content the
     # agent can author, and this body is rendered by the dashboard.
     for c in result.get("commits", []):
