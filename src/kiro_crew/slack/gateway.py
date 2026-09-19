@@ -10073,6 +10073,11 @@ class GatewayOrchestrator:
             completion_keep=self._cfg.agent.completion_keep,
             completion_keep_chars=self._cfg.agent.completion_keep_chars,
         )
+        # A parent that ends takes its children with it, on every backend. The
+        # session lifecycle owns the boundary and fires this at each of its
+        # parent-end paths, so no surface that closes, resets, discards or
+        # retires a conversation needs a cancel call of its own.
+        self.sessions.set_child_cancel_callback(self.subagent_mgr.cancel_for_parent)
         self.subagent_mgr.start_reaper()
 
     def _register_child_liveness(self) -> None:

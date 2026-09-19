@@ -2377,6 +2377,16 @@ class SessionManager:
             session.floor_pending = True
         return True
 
+    def set_child_cancel_callback(self, cb: Any) -> None:
+        """Register the hook that stops a parent's sub-agent runs at parent end.
+
+        Called once at wiring time with ``SubagentManager.cancel_for_parent``.
+        Every parent-end path in :mod:`kiro_crew.session_lifecycle` fires it, so
+        a surface that ends a conversation — the dashboard, a channel command,
+        the idle sweep — inherits the behaviour without a call of its own.
+        """
+        self._lifecycle_boundary().set_child_cancel_callback(cb)
+
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the lifecycle recycle callback."""
         self._lifecycle_boundary().set_recycle_callback(cb)

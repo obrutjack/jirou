@@ -5888,3 +5888,203 @@ class TestIneffectiveCompactionCooldown:
         # with no inherited damping.
         assert "dashboard:chat-1" not in mgr._compact_cooldown_until
         await mgr.close_all()
+
+
+class TestParentEndCancelsItsChildren:
+    """A parent that ends takes its sub-agent runs with it, on every backend.
+
+    Releasing the companion runtime already ends the children of a harness that
+    multiplexes them onto one process — killing that process is what ends them,
+    so it is a side effect rather than a decision. A harness that runs one
+    process per child has no entry in ``_subagent_runtimes``, so the release
+    reaches nothing and its children outlive the conversation that asked for
+    them, each holding an agent process and that process's MCP fleet until its
+    own run timeout expires. The lifecycle asks the manager to cancel at every
+    site that releases the runtime, which makes the two harness shapes agree
+    without either being named.
+    """
+
+    @staticmethod
+    def _recorder() -> tuple[list[str], object]:
+        """A cancel callback shaped like ``SubagentManager.cancel_for_parent``."""
+        seen: list[str] = []
+
+        async def cancel_for_parent(parent_session_key: str) -> tuple[int, int]:
+            seen.append(parent_session_key)
+            return (1, 0)
+
+        return seen, cancel_for_parent
+
+    @pytest.mark.asyncio
+    async def test_reset_cancels_children_without_a_companion_runtime(self, cfg):
+        """The cancel sits OUTSIDE the ``_subagent_runtimes`` membership guard.
+
+        That guard is the kiro-shaped condition: a per-process harness never
+        appears in it, and its children are exactly the ones that would
+        otherwise survive.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+
+        assert "dashboard:chat-9" not in mgr._subagent_runtimes
+        assert await mgr.reset("dashboard:chat-9") is True
+
+        assert seen == ["dashboard:chat-9"]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_remove_cancels_children(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+
+        await mgr.remove("dashboard:chat-9")
+
+        assert seen == ["dashboard:chat-9"]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_destroy_cancels_children(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+
+        await mgr.destroy("dashboard:chat-9")
+
+        assert seen == ["dashboard:chat-9"]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_discard_conversation_cancels_children(self, cfg):
+        """A fresh conversation under the same slot ends the old one's children."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+
+        assert await mgr.discard_conversation("dashboard:chat-9") is True
+
+        assert seen == ["dashboard:chat-9"]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_remove_if_unclaimed_cancels_children(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        # A speculative session is removable only while its first turn is armed
+        # and unclaimed: the arm is a non-sentinel ``first_turn``, and unclaimed
+        # means nothing holds the session's semaphore.
+        mgr.release("dashboard:chat-9")
+        mgr._sessions["dashboard:chat-9"].first_turn = object()
+
+        assert await mgr.remove_if_unclaimed("dashboard:chat-9") is True
+
+        assert seen == ["dashboard:chat-9"]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_cancels_children(self, cfg):
+        """An identity-store change retires a session, so its children end too."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, _complete = await mgr.retire_kiro_identity_sessions()
+
+        assert retired == ["dashboard:chat-9"]
+        assert seen == ["dashboard:chat-9"]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_close_all_leaves_cancellation_to_cancel_all(self, cfg):
+        """Gateway shutdown is deliberately not a per-key cancel.
+
+        ``SubagentManager.cancel_all`` runs there instead: it also drains
+        follow-up watchers and announces undelivered messages, which a per-key
+        cancel does not do.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        seen, cb = self._recorder()
+        mgr.set_child_cancel_callback(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+
+        await mgr.close_all()
+
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_cancel_never_blocks_the_parent_end(self, cfg):
+        """Best-effort, matching the recycle callback beside it."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        async def boom(parent_session_key: str) -> tuple[int, int]:
+            raise RuntimeError("subagent manager is wedged")
+
+        mgr.set_child_cancel_callback(boom)
+        provider, _, _ = await mgr.get_or_create("dashboard:chat-9")
+
+        await mgr.remove("dashboard:chat-9")
+
+        assert mgr.count == 0
+        provider.shutdown.assert_awaited_once()
+        await mgr.close_all()
+
+    def test_every_parent_end_release_site_cancels_first(self):
+        """Ratchet: the two halves of ending a parent stay together.
+
+        ``release_subagent_runtime`` IS this module's parent-end boundary, so a
+        site that reaps the companion runtime without cancelling the runs first
+        is a parent end that lets a per-process harness's children survive. A
+        future author adding such a path is caught here rather than by an
+        operator finding the process.
+
+        ``close_all`` is the one exemption, for the reason
+        ``_cancel_parent_children`` records.
+        """
+        import inspect
+
+        from kiro_crew import session_lifecycle
+
+        source = inspect.getsource(session_lifecycle).splitlines()
+        release_lines = [
+            index
+            for index, line in enumerate(source)
+            if "release_subagent_runtime(key)" in line and "def " not in line
+        ]
+        assert len(release_lines) >= 6, (
+            "the release sites moved or were renamed; this ratchet is reading " "the wrong thing"
+        )
+
+        # Attribute each release to the method that owns it.
+        def enclosing_def(index: int) -> str:
+            for back in range(index, -1, -1):
+                stripped = source[back].lstrip()
+                if stripped.startswith("async def ") or stripped.startswith("def "):
+                    return stripped.split("(")[0].removeprefix("async def ").removeprefix("def ")
+            return "<module>"
+
+        unguarded: list[str] = []
+        for index in release_lines:
+            owner = enclosing_def(index)
+            if owner == "close_all":
+                continue
+            window = "\n".join(source[max(0, index - 12) : index])
+            if "_cancel_parent_children(key)" not in window:
+                unguarded.append(f"{owner} (line {index + 1})")
+
+        assert not unguarded, (
+            "these parent-end paths reap the companion runtime without "
+            f"cancelling the parent's runs first: {unguarded}"
+        )

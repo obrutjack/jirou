@@ -51,9 +51,25 @@ StopOutcome = Literal["soft", "hard", "idle"]
 ProviderFactory = Callable[..., Any]
 _ANY_SESSION = object()
 
+#: Budget for cancelling one parent's sub-agent runs at a parent end. A parent
+#: end is on a user-facing path (a closed tab, a switched model), so an
+#: unresponsive child must not hold it open; the companion-runtime release that
+#: follows is the backstop for whatever the cancel does not reach in time.
+_CHILD_CANCEL_TIMEOUT_SECS = 20.0
+
 
 class _RecycleCallback(Protocol):
     async def __call__(self, key: str, *, reason: str) -> None: ...
+
+
+class _ChildCancelCallback(Protocol):
+    """Stop the sub-agent runs a parent session key spawned.
+
+    Satisfied by ``SubagentManager.cancel_for_parent``, which returns
+    ``(running_stopped, queued_stopped)``; the return is ignored here.
+    """
+
+    async def __call__(self, parent_session_key: str) -> tuple[int, int]: ...
 
 
 class _SessionEntry(Protocol):
@@ -233,6 +249,7 @@ class SessionLifecycleState:
     suppress_replay: set[str] = field(default_factory=set)
     origin_links: dict[str, Any] = field(default_factory=dict)
     on_recycled: _RecycleCallback | None = None
+    on_child_cancel: _ChildCancelCallback | None = None
     # Per-session-key count of Stop requests, keyed by folded key. Bumped by
     # :meth:`SessionLifecycleService.stop_turn` BEFORE the provider cancel is
     # awaited, so a turn runner that snapshots the count at turn start and
@@ -309,6 +326,14 @@ class SessionLifecycleService:
     @_on_recycled.setter
     def _on_recycled(self, callback: _RecycleCallback | None) -> None:
         self.state.on_recycled = callback
+
+    @property
+    def _on_child_cancel(self) -> _ChildCancelCallback | None:
+        return self.state.on_child_cancel
+
+    @_on_child_cancel.setter
+    def _on_child_cancel(self, callback: _ChildCancelCallback | None) -> None:
+        self.state.on_child_cancel = callback
 
     async def refresh_defaults(self, cfg: Any = None) -> None:
         """Adopt config changes that only affect new sessions.
@@ -607,6 +632,10 @@ class SessionLifecycleService:
                         )
                     except Exception:
                         logger.exception("Reset %s: child sweep failed", key)
+            # Outside the membership guard below: a harness with one process
+            # per child has no entry there, and its children are the ones that
+            # would otherwise outlive this teardown.
+            await self._cancel_parent_children(key)
             if key in owner._subagent_runtimes:
                 try:
                     await owner.release_subagent_runtime(key)
@@ -637,6 +666,57 @@ class SessionLifecycleService:
         except Exception:
             self._deps.logger.exception("Recycle callback failed for %s", key)
 
+    def set_child_cancel_callback(self, cb: _ChildCancelCallback | None) -> None:
+        """Register the sub-agent cancellation hook used at every parent end."""
+        if self._on_child_cancel is not None and cb is not None:
+            self._deps.logger.warning(
+                "Child-cancel callback already registered; replacing existing handler"
+            )
+        self._on_child_cancel = cb
+
+    async def _cancel_parent_children(self, key: str) -> None:
+        """Stop the runs *key* spawned, ahead of reaping the runtime they share.
+
+        Paired with :meth:`SessionManager.release_subagent_runtime` at every site
+        that calls it, because that call IS this module's parent-end boundary and
+        the two halves of ending a parent belong together.
+
+        The pairing is what makes the rule backend-independent. Releasing the
+        companion runtime kills the process a session-sharing child lives ON, so
+        a parent end already ends the children of a harness that multiplexes —
+        as a side effect of reaping the process, not as a decision. A harness
+        that runs one process per child has no entry in ``_subagent_runtimes``,
+        so the release reaches nothing and its children outlive the conversation
+        that asked for them, each holding its own agent process and that
+        process's MCP fleet until its own run timeout expires. Asking the manager
+        to cancel makes the same thing happen for every harness, by intent, and
+        it happens FIRST so a child is stopped through its own teardown rather
+        than by having its runtime pulled out from under a live turn.
+
+        Bounded and best-effort, matching :meth:`_fire_recycle_callback`: a
+        parent end must not hang or fail on an unresponsive child, and the
+        release below is the backstop for anything the cancel does not reach.
+
+        ``close_all`` is deliberately NOT a caller. Gateway shutdown cancels
+        every run at once through ``SubagentManager.cancel_all``, which also
+        drains follow-up watchers and announces undelivered messages — work a
+        per-key cancel does not do.
+        """
+        callback = self._on_child_cancel
+        if callback is None or not key:
+            return
+        try:
+            await asyncio.wait_for(callback(key), timeout=_CHILD_CANCEL_TIMEOUT_SECS)
+        except asyncio.TimeoutError:
+            self._deps.logger.warning(
+                "Parent end %s: cancelling sub-agents exceeded %.0fs; "
+                "the runtime release still runs",
+                key,
+                _CHILD_CANCEL_TIMEOUT_SECS,
+            )
+        except Exception:
+            self._deps.logger.exception("Parent end %s: cancelling sub-agents failed", key)
+
     async def remove(self, key: str) -> None:
         """Shut down a session while preserving its session-map entry."""
         owner = self._owner
@@ -658,6 +738,7 @@ class SessionLifecycleService:
             await session.provider.shutdown()
             # A companion subagent runtime lives outside the provider registry
             # and must be reaped separately from the parent provider.
+            await self._cancel_parent_children(key)
             await owner.release_subagent_runtime(key)
             self._deps.logger.info("Removed session (map preserved): %s", key)
 
@@ -720,6 +801,7 @@ class SessionLifecycleService:
         for key, provider in doomed:
             try:
                 await provider.shutdown()
+                await self._cancel_parent_children(key)
                 await owner.release_subagent_runtime(key)
                 retired.append(key)
             except Exception:
@@ -829,6 +911,7 @@ class SessionLifecycleService:
             await record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
         await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
         await session.provider.shutdown()
+        await self._cancel_parent_children(key)
         await owner.release_subagent_runtime(key)
         self._deps.logger.info(
             "Removed unclaimed speculative session (map preserved): %s",
@@ -966,6 +1049,7 @@ class SessionLifecycleService:
             if session:
                 await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
                 await session.provider.shutdown()
+            await self._cancel_parent_children(key)
             await owner.release_subagent_runtime(key)
         finally:
             self._deps.logger.info("Destroyed session (map deleted): %s", key)
@@ -1054,6 +1138,7 @@ class SessionLifecycleService:
             if session:
                 await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
                 await session.provider.shutdown()
+            await self._cancel_parent_children(key)
             await owner.release_subagent_runtime(key)
         finally:
             self._deps.logger.info(
