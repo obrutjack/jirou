@@ -338,8 +338,31 @@ def store_of_session(conversation_log: object, session_key: str) -> str:
             raise ValueError("Session metadata is unreadable")
         if "memory_store" in meta and not isinstance(meta["memory_store"], str):
             raise ValueError("The recorded memory identity is invalid")
-        if protected is not None and meta.get("memory_store") != protected:
-            raise ValueError("Session metadata disagrees with its protected member binding")
+        if protected is not None:
+            # The immutable, gateway-written binding is the trusted authority;
+            # the agent-editable transcript is a lower-trust cross-check that can
+            # lag behind it. A chat slot is issued its member identity through the
+            # binding directly, so its transcript metadata often records no named
+            # store yet -- an absent ``memory_store`` key, an empty string, or the
+            # ``default`` sentinel, all of which mean global V1. That lag is not a
+            # disagreement: resolve to the binding. Only metadata that NAMES A
+            # DIFFERENT store disagrees and refuses -- metadata can never widen or
+            # redirect the trusted assignment, only fail to have caught up to it.
+            #
+            # A healthy binding must resolve regardless of global-store health, so
+            # absent/blank/``default`` metadata is normalized directly here rather
+            # than through ``_resolved_store_name``, whose V1 readiness probe would
+            # couple this path to the global store. Only a genuinely named
+            # metadata store is validated, and the binding itself resolves through
+            # its own named-store check.
+            from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE, require_memory_store
+
+            raw = meta.get("memory_store")
+            if raw is not None and raw not in ("", DEFAULT_MEMORY_STORE):
+                recorded = _resolved_store_name(raw)
+                if recorded and recorded != protected:
+                    raise ValueError("Session metadata disagrees with its protected member binding")
+            return require_memory_store(protected)
         store = _resolved_store_name(meta.get("memory_store"))
         if store and protected is None:
             from kiro_crew.memory_stores import memory_store_version

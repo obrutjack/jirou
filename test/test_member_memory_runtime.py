@@ -937,10 +937,7 @@ def test_legacy_resume_without_member_binding_remains_global():
     assert read_run_memory_store("legacy") == ""
 
 
-@pytest.mark.parametrize("replacement", [None, "", "default", "other"])
-def test_private_channel_binding_survives_restart_and_refuses_metadata_downgrade(
-    member_stores, replacement
-):
+def test_private_channel_binding_survives_restart_and_refuses_metadata_downgrade(member_stores):
     from kiro_crew.context import store_of_session
     from kiro_crew.member_memory_auth import bind_private_session_store
 
@@ -951,14 +948,82 @@ def test_private_channel_binding_survives_restart_and_refuses_metadata_downgrade
     log.update_metadata(key, {"memory_store": writer})
     bind_private_session_store(key, writer)
     assert store_of_session(ConversationLog(), key) == writer
-    record = (
-        {}
-        if replacement is None
-        else {"memory_store": reviewer if replacement == "other" else replacement}
-    )
+    # A metadata value that NAMES A DIFFERENT V2 store is a genuine disagreement
+    # and still refuses: the agent-editable transcript can never redirect the
+    # trusted binding to another member's memory.
     with pytest.raises(UnknownMemoryStore, match="protected member binding"):
-        store_of_session(SimpleNamespace(get_metadata=lambda _: record), key)
+        store_of_session(SimpleNamespace(get_metadata=lambda _: {"memory_store": reviewer}), key)
+    # A binding-less session gains nothing from metadata alone.
     assert store_of_session(SimpleNamespace(get_metadata=lambda _: {}), "slack:legacy") == ""
+
+
+@pytest.mark.parametrize("recorded", [None, "", "default"])
+def test_binding_is_the_authority_when_transcript_records_no_named_store(member_stores, recorded):
+    """A chat slot's transcript often lags the binding: no ``memory_store`` key,
+    an empty string, or the ``default`` sentinel all mean "no named store recorded
+    yet", not a disagreement. The trusted binding resolves the store."""
+    from kiro_crew.context import store_of_session
+    from kiro_crew.member_memory_auth import bind_private_session_store
+
+    writer, _ = member_stores
+    key = "dashboard:chat-13-lagging-metadata"
+    bind_private_session_store(key, writer)
+    metadata = {} if recorded is None else {"memory_store": recorded}
+    # Both the ``get_metadata_status`` reader (in-sandbox history scope path) and
+    # the plain ``get_metadata`` reader must resolve to the binding.
+    status_log = SimpleNamespace(
+        get_metadata=lambda _: metadata, get_metadata_status=lambda _: (metadata, True)
+    )
+    plain_log = SimpleNamespace(get_metadata=lambda _: metadata)
+    assert store_of_session(status_log, key) == writer
+    assert store_of_session(plain_log, key) == writer
+
+
+def test_history_scope_resolves_for_a_chat_slot_whose_metadata_lacks_the_store(member_stores):
+    """The in-sandbox history tools (list_sessions / search_chat_history /
+    get_chat_session) resolve a scope for a bound member even when the hidden
+    transcript metadata records no named store."""
+    from kiro_crew.context import store_of_session
+    from kiro_crew.member_memory_auth import (
+        bind_private_session_store,
+        private_memory_store_for_session,
+    )
+
+    writer, _ = member_stores
+    key = "dashboard:chat-13-history-scope"
+    bind_private_session_store(key, writer)
+    # ``{}, True`` mirrors ConversationLog.get_metadata_status for a hidden
+    # transcript dir: reported readable, but carrying no metadata in-sandbox.
+    log = SimpleNamespace(get_metadata=lambda _: {}, get_metadata_status=lambda _: ({}, True))
+    assert store_of_session(log, key) == writer
+    # private_memory_store_for_session (the scope resolver behind mcp_memory_scope)
+    # reads through store_of_session, so a scope now resolves instead of raising.
+    assert private_memory_store_for_session(key) == writer
+
+
+def test_bound_store_resolves_while_global_store_restore_has_failed(member_stores, monkeypatch):
+    """A healthy private binding resolves independently of global-store health.
+    Absent/blank/``default`` metadata is normalized directly, so a failed global
+    V1 restore leaves a bound member's own store resolvable."""
+    from kiro_crew import memory_startup
+    from kiro_crew.context import store_of_session
+    from kiro_crew.member_memory_auth import bind_private_session_store
+    from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+
+    writer, _ = member_stores
+    key = "dashboard:chat-13-global-down"
+    bind_private_session_store(key, writer)
+    # The global V1 store is stuck in a failed restore; require_memory_ready would
+    # raise MemoryStartupUnavailable for it.
+    monkeypatch.setattr(
+        memory_startup,
+        "memory_store_startup_error",
+        lambda store=DEFAULT_MEMORY_STORE: (
+            "restore in progress" if (store or DEFAULT_MEMORY_STORE) == DEFAULT_MEMORY_STORE else ""
+        ),
+    )
+    log = SimpleNamespace(get_metadata=lambda _: {})
+    assert store_of_session(log, key) == writer
 
 
 def test_private_session_cannot_be_rebound_or_lose_its_protected_record(member_stores):
@@ -990,6 +1055,28 @@ def test_private_caller_cannot_delegate_into_legacy_or_peer_memory(member_stores
     with pytest.raises(UnknownMemoryStore, match="must retain"):
         require_memory_delegation(log, key, selected)
     require_memory_delegation(log, key, writer)
+
+
+@pytest.mark.parametrize("recorded", [None, "", "default"])
+def test_delegation_passes_for_a_bound_caller_whose_transcript_lacks_the_store(
+    member_stores, recorded
+):
+    """The gateway ``session_create`` delegation gate resolves the caller's store
+    through ``store_of_session``. A chat slot whose transcript has not yet recorded
+    its named store must delegate within its own member, not 403."""
+    from kiro_crew.context import require_memory_delegation
+    from kiro_crew.member_memory_auth import bind_private_session_store
+
+    writer, reviewer = member_stores
+    key = "dashboard:chat-13-delegator"
+    bind_private_session_store(key, writer)
+    metadata = {} if recorded is None else {"memory_store": recorded}
+    log = SimpleNamespace(get_metadata=lambda _: metadata)
+    # Delegating within the caller's own member is allowed.
+    require_memory_delegation(log, key, writer)
+    # Delegating into another member's store is still refused.
+    with pytest.raises(UnknownMemoryStore, match="must retain"):
+        require_memory_delegation(log, key, reviewer)
 
 
 @pytest.mark.asyncio

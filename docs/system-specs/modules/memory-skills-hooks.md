@@ -3215,7 +3215,16 @@ which one applies is decided by what identity the surface holds:
   where the crew is what the caller was asked for.
 - **Only a session key in scope** → `context.store_of_session(conversation_log, key)`,
   which validates the recorded `meta["memory_store"]`. Protected subagent run
-  identity is authoritative before transcript metadata is consulted. This
+  identity is authoritative before transcript metadata is consulted. So is a
+  protected **member** binding: when a session carries one (a chat slot is issued
+  its member identity through the binding, not through the transcript), the
+  immutable binding is the trusted authority and the agent-editable transcript is
+  a lower-trust cross-check that can lag it. Transcript metadata recording no
+  named store yet — an absent `memory_store` key, blank, or the literal `default`,
+  all of which resolve to global V1 — is that lag, not a disagreement, so the
+  binding resolves the store. Only metadata that NAMES A DIFFERENT store is a real
+  disagreement and refuses: metadata can never widen or redirect the binding, only
+  fail to have caught up to it (GH #11862). This
   is every channel surface. `context.session_store_for_turn(ctx_builder, key)` is the
   pair a turn needs — that resolution, then `prepare_store_vectors` — and it is what
   Slack (native and transport), Discord, Telegram, the shared `messaging/dispatch`
@@ -3256,7 +3265,10 @@ consolidator's constructor:
   forward. Private member bindings themselves are immutable.
 - `context.store_of_session(log, key)` answers `""` for no key, the literal default or a
   blank value. Every other value passes strict named-store validation; invalid
-  or unavailable identity aborts that consolidation without a global write.
+  or unavailable identity aborts that consolidation without a global write. When a
+  protected member binding exists, it is the authority: a transcript recording no
+  named store yet (absent, blank or `default`) resolves to the binding, and only a
+  differently-named store disagrees and raises.
 - `_consolidate` then resolves all three handles for a named store — markdown via
   `get_memory_for(memory_store=…)`, lessons via `get_lessons_for(memory_store=…)`,
   vectors via `await ensure_store(…)` — and passes them into

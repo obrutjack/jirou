@@ -558,10 +558,21 @@ async def test_startup_captures_native_inputs_after_real_private_binding(env, mo
 
 @pytest.mark.asyncio
 async def test_existing_receipt_cannot_bypass_changed_protected_binding(env):
-    from kiro_crew.context import session_store_for_turn
+    """A stale transcript can never widen a bound turn to global memory.
+
+    The immutable binding is the authority; the agent-editable transcript is a
+    lower-trust cross-check. An edit that blanks the recorded store to the
+    ``default`` sentinel is a transcript that has *lagged* the binding, not one
+    that disagrees with it -- so the turn resolves to the bound store, never
+    downgrades to global V1. That is the receipt-bypass guarantee: a later
+    transcript edit cannot silently drop the binding and send the turn to global.
+    (A transcript that NAMES A DIFFERENT store IS a real disagreement and still
+    refuses; that path needs a second real store and is covered by
+    ``test_member_memory_runtime`` against ``member_stores``.)
+    """
+    from kiro_crew.context import store_of_session
     from kiro_crew.history import ConversationLog
     from kiro_crew.member_memory_auth import bind_private_session_store
-    from kiro_crew.memory_stores import UnknownMemoryStore
 
     key = "dashboard:private"
     bind_private_session_store(key, env.store)
@@ -570,9 +581,13 @@ async def test_existing_receipt_cannot_bypass_changed_protected_binding(env):
     env.builder.conversation_log = log
     target = provider(env.project)
     await send(target, build(env, target, fresh=True))
+    # Blanking the transcript to the default sentinel does NOT downgrade to
+    # global: resolution still returns the bound protected store. Asserted
+    # through ``store_of_session`` -- the resolver the guard lives in -- since
+    # ``session_store_for_turn`` would add an unrelated ``prepare_store_vectors``
+    # step that stands up the V2 vector tier.
     log.update_metadata(key, {"memory_store": "default"})
-    with pytest.raises(UnknownMemoryStore, match="protected member binding"):
-        await session_store_for_turn(env.builder, key)
+    assert store_of_session(log, key) == env.store
     assert len(target.client.messages) == 1
 
 
