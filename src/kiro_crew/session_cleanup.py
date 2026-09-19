@@ -128,6 +128,15 @@ class CleanupState:
     last_pycache_gc: float | None = None
     member_reclaim_cursor: RecordScan | None = None
     active_dashboard_slots: set[str] | None = None
+    # Every session key a dashboard slot has owned since boot, which is what
+    # makes "this session's owner is gone" answerable for a key of ANY shape.
+    # ``active_dashboard_slots`` alone cannot answer it: absence from that set
+    # is equally true of a session that never had a slot and is legitimately
+    # running without one (a cron fire, a task step, a hook), so reaping on
+    # absence alone would kill live work. A key recorded here and now absent
+    # from the live set had an owner and lost it. Pruned every sweep to the
+    # keys still in the session map, so it is bounded by that map.
+    slot_owned_keys: set[str] = field(default_factory=set)
     watchdog: SessionWatchdog | None = None
 
 
@@ -779,7 +788,37 @@ class SessionCleanup:
             self._deps.logger.warning("Orphan MCP sweep failed", exc_info=True)
 
     def set_active_dashboard_slots(self, slot_keys: set[str]) -> None:
-        self.state.active_dashboard_slots = set(slot_keys)
+        """Adopt the dashboard's open-slot set as the live-owner authority.
+
+        Publishing also RECORDS the keys as slot-owned, which is what later lets
+        the sweep tell a session whose owner is gone from one that never had an
+        owner. Recorded on publish rather than at session creation because this
+        is the one call that already knows the answer.
+        """
+        live = set(slot_keys)
+        self.state.active_dashboard_slots = live
+        self.state.slot_owned_keys |= live
+
+    def _owner_is_gone(self, key: str) -> bool:
+        """Whether *key*'s owning dashboard slot existed and is now closed.
+
+        Two populations answer yes, to deliberately different questions. A
+        ``dashboard:`` key is owned by a slot by construction, so the live set
+        alone settles it; that is the long-standing behaviour and is unchanged.
+        Any OTHER key is owned by a slot only if one claimed it -- a
+        channel-born slot contributes its channel key, a linked slot its
+        ``linked_session_key`` -- so it must have appeared in a published live
+        set before its absence from that set means anything. Without that
+        record, absence is equally true of a cron fire, a task step or a hook
+        that is running right now and never had a tab.
+
+        False while no live set has been published at all, so a build with no
+        dashboard never reaps on this axis.
+        """
+        live = self.state.active_dashboard_slots
+        if live is None or key in live:
+            return False
+        return key.startswith("dashboard:") or key in self.state.slot_owned_keys
 
     async def _expire_idle(self, timeout_secs: int) -> None:
         now = self._deps.monotonic()
@@ -795,13 +834,12 @@ class SessionCleanup:
                 if session.semaphore.locked():
                     continue
                 idle = now - session.last_used > timeout_secs
-                orphaned = (
-                    key.startswith("dashboard:")
-                    and self.state.active_dashboard_slots is not None
-                    and key not in self.state.active_dashboard_slots
-                )
+                orphaned = self._owner_is_gone(key)
                 if idle or orphaned:
                     expired.append((key, orphaned))
+            # A key is only worth remembering while its session exists, which
+            # bounds the record by the session map instead of by uptime.
+            self.state.slot_owned_keys &= set(self._owner._sessions)
 
         if expired:
             self._deps.logger.warning(
@@ -814,6 +852,27 @@ class SessionCleanup:
 
         for key, is_orphan in expired:
             if is_orphan:
+                # Re-ask against the CURRENT live set, not the one the scan
+                # read. The scan runs under the lock and this loop awaits, so a
+                # slot can reopen in between; reaping on the stale answer is
+                # how a session the user just resumed loses its runtime.
+                if not self._owner_is_gone(key):
+                    self._deps.logger.info(
+                        "Idle sweep: %s regained its slot before reset - left running",
+                        key,
+                    )
+                    continue
+                # A closed tab is not the same as finished work. With session
+                # sharing on, sub-agents run on the parent's runtime after the
+                # parent's own turn ends, so the busy semaphore cannot see them
+                # and the probe is the only witness. Fail-closed: a probe that
+                # cannot answer keeps the session.
+                if await self._has_attached_subagents(key):
+                    self._deps.logger.info(
+                        "Idle sweep: %s still has sub-agent work - left running",
+                        key,
+                    )
+                    continue
                 self._deps.logger.warning(
                     "Expiring orphaned dashboard session (slot gone): %s",
                     key,

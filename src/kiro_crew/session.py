@@ -73,6 +73,17 @@ Four mechanisms clean up processes. They are complementary — not redundant.
    Kills sessions idle for >``timeout_secs`` (default 60 min) via
    ``reset()`` → ``provider.shutdown()`` → SIGKILL process tree.
    Protected keys: ``_PERSISTENT_KEYS`` (``_bg`` and ``_hb``).
+   Also expires on a second, clock-independent axis: the session's owning
+   dashboard slot is gone (``_owner_is_gone``). A ``dashboard:`` key is
+   slot-owned by construction; a key of any other shape counts as slot-owned
+   only if a published live set once carried it, which is what keeps a
+   ``cron:`` fire or a ``taskrunner:{id}:task{n}`` step that never had a tab
+   from being read as finished. That axis re-asserts against the live set
+   immediately before the reset and refuses a session with attached sub-agent
+   work. *Cannot be replaced by the idle clock* — a finished session holds its
+   runtime and its per-session MCP servers for the whole timeout, so the live
+   process count is the number of unreaped sessions times the servers each one
+   spawns.
    **Known limitation**: ``last_used`` is only bumped on ``get_or_create()``,
    not on every LLM round-trip. A task runner step doing continuous work for
    >60 min without a new ``get_or_create()`` call could be swept. This is

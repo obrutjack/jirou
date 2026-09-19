@@ -703,7 +703,32 @@ send time.
   the resolution falls through to `"auto"` exactly as an absent spec does.
 - **Idle cleanup**: expires sessions after `session.timeout_secs` (default
   60min). Never expires `BACKGROUND_KEY`. Dashboard per-tab sessions
-  (`dashboard:{slot_key}`) idle-expire like any other session. The policy is
+  (`dashboard:{slot_key}`) idle-expire like any other session.
+  A session is also expired on a second, clock-independent axis: its owning
+  dashboard slot is gone. `SessionCleanup._owner_is_gone()` answers that, and it
+  asks a deliberately different question of two populations. A
+  `dashboard:`-prefixed key is slot-owned by construction, so absence from
+  `CleanupState.active_dashboard_slots` settles it; that set is published by
+  `chat_utils._sync_dashboard_slots`, which sends the *effective* key of every
+  open slot. A key of any other shape, such as a channel-born slot's channel key
+  or a linked slot's `linked_session_key` (`taskrunner:{id}:chat:{tok}`,
+  `cron:{job}`), is slot-owned only if a published live set once carried it.
+  That is recorded in `CleanupState.slot_owned_keys` at publish time and pruned
+  every sweep to the keys still in `_sessions`, so the record is bounded by the
+  session map rather than by uptime. The record is what makes the axis safe:
+  without it, absence from the live set is equally true of a `cron:` fire, a
+  `taskrunner:{id}:task{n}` step or a `hook:` session that is running right now
+  and never had a tab, so reaping on absence alone would end live work instead
+  of finished work. Two further guards apply to this axis only. The answer is
+  re-asserted against the current live set immediately before `reset`, because
+  the candidate scan runs under the lock and the sweep then awaits, so a tab can
+  reopen in between and a resumed session must not be reaped on the stale
+  answer. And it consults the same `CleanupDeps.has_attached_subagents` probe
+  the RSS recycle uses, fail-closed, because with session sharing on a parent's
+  children run on its runtime after its own turn ends and the busy semaphore
+  cannot see them. While no live set has been published at all
+  (`active_dashboard_slots is None`) the axis expires nothing, so a build with
+  no dashboard keeps the idle timer as its only reaper. The policy is
   **re-read every tick**, not frozen at loop start: `_adopt_idle_policy()` runs
   at the top of the loop and again before each sleep, taking
   `session.timeout_secs` and `session.watchdog_rss_max_mb` off the manager's
