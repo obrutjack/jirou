@@ -2186,6 +2186,16 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
           {i18nT('pages.settings.securityPanel.disabling_a_rule_that_overlaps_an_always_on_cont')}
         </div>
 
+        {/* The tier's REACH, stated where a rule is added or switched off. These
+          * rules read the command line a tool call carries and never the body of
+          * a program that line starts, so an operator who reads the list below as
+          * a fence over-trusts it. Same disclosure as the "What this tier cannot
+          * see" section of `src/kiro_crew/docs/blocked-commands.md`, which is
+          * where the closure mechanism (the OS-level sandbox) is explained. */}
+        <div className="text-[12px] text-muted mt-1 mb-2 leading-relaxed" data-testid="denied-indirection-limit">
+          {i18nT('pages.settings.securityPanel.rules_read_the_command_line_not_the_program_body')}
+        </div>
+
         {!dc ? (
           <div className="text-[12px] text-muted py-2">{i18nT('pages.settings.securityPanel.loading_built_in_rules')}</div>
         ) : (

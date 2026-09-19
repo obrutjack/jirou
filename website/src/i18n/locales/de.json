@@ -14038,6 +14038,7 @@
         "third_party_apps_state_unknown": "Nicht verfügbar",
         "third_party_apps_unavailable": "Die aktuelle Einstellung konnte nicht gelesen werden, daher kann sie hier nicht angezeigt oder geändert werden. War sie bereits aktiv, bleiben Drittanbieter-Apps weiterhin erlaubt – lade die Seite neu, um es erneut zu versuchen.",
         "tool_approval": "Werkzeuggenehmigung",
+        "rules_read_the_command_line_not_the_program_body": "Diese Regeln lesen die Befehlszeile, die ein Tool-Aufruf mitbringt, einschließlich eines Programms, das direkt darin steht, aber niemals den Inhalt eines Programms, das die Zeile nur benennt – ein Befehl in einem solchen Programm wird deshalb nicht erkannt. Diese Liste ist Reibung gegen eine direkte Befehlszeile, kein Zaun; die Lücke schließt die Sandbox auf Betriebssystemebene.",
         "turn_off_every_rule": "Alle integrierten Regeln für verbotene Befehle auf einmal deaktivieren. Unabhängige Defense-in-Depth-Steuerelemente (sensible Pfade, IMDS, git-publish) bleiben durchgesetzt.",
         "turn_off_every_rule_governance_locked": "Alle integrierten Regeln für verbotene Befehle auf einmal deaktivieren. Unabhängige Defense-in-Depth-Steuerelemente (sensible Pfade, IMDS, git-publish) bleiben durchgesetzt, und Regeln, die durch die Richtlinie deiner Organisation festgelegt sind, bleiben aktiv.",
         "yolo_active_expires_at": "Die automatische Genehmigung ist bis {{time}} aktiv.",

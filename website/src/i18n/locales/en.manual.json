@@ -5839,6 +5839,7 @@
         "security_module_spec": "Security Module Spec",
         "show_pattern": "Show pattern",
         "standard": "Standard",
+        "rules_read_the_command_line_not_the_program_body": "These rules read the command line a tool call carries, including a program spelled out on it, but never a body the line only names — so a command carried inside one is not matched. This list is friction against a direct command line rather than a fence; the OS-level sandbox is the layer that closes the gap.",
         "turn_off_every_rule": "Turn off every built-in denied-command rule at once. Independent defense-in-depth controls (sensitive paths, IMDS, git-publish) stay enforced.",
         "turn_off_every_rule_governance_locked": "Turn off every built-in denied-command rule at once. Independent defense-in-depth controls (sensitive paths, IMDS, git-publish) stay enforced, and rules pinned by your organization’s policy remain on.",
         "yolo_auto_approve": "YOLO (auto-approve)",
