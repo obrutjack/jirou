@@ -165,6 +165,15 @@ structural reason the same missing-tools defect shipped on four harnesses in a r
    checks it. The declaration is what code reads; the onboarding table is what a
    human reads BEFORE writing any of this, so a gap recorded in only one of the
    two is a gap the next author misses.
+7. **Measure the adapter, in the lane.** Anything you learn by driving the real
+   adapter belongs in a guarded contract test, and those run in CI's `Real Adapter
+   Contract Tests` lane: it installs the release pinned in `test/real_adapter_gate.py`
+   and sets `KIROCREW_E2E_REQUIRE=1`, so an absent adapter fails the lane instead of
+   skipping it. Mark the new test `@pytest.mark.real_adapter`, call the gate in its
+   body, and add its pinned version beside the existing ones; a measurement no lane
+   runs is a measurement that stops being true without telling anyone. That module's
+   docstring also carries what the pin does not cover, and what to do when the lane
+   reds without one being bumped.
 
 The folder makes a mirror easy to find and easy to copy. The test is what asks
 the question. Both are needed — a folder alone is just a tidier place to forget.
