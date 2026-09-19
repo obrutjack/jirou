@@ -22,8 +22,8 @@ OpenAI-compatible API endpoint — most commonly **LM Studio** running **Qwen3 1
 
 | Location | What it is |
 |---|---|
-| `~/_jackliu/app_project/jirou/` | This repo — KiroCrew fork |
-| `~/_jackliu/app_project/jirou-poc/` | Old Electron + FastAPI proof-of-concept (archived) |
+| `~/jirou/` | This repo — KiroCrew fork |
+| `~/jirou-poc/` | Old Electron + FastAPI proof-of-concept (archived) |
 | `~/.kiro/jirou/` | Isolated KiroCrew data home for this fork |
 
 ---
@@ -68,7 +68,7 @@ Default port: `1234` (matches our default `LOCAL_LLM_BASE_URL`)
 ### Step 1: Set up Python venv
 
 ```bash
-cd ~/_jackliu/app_project/jirou
+cd ~/jirou
 python3 -m venv .venv
 source .venv/bin/activate
 pip install openai
@@ -111,7 +111,7 @@ LOCAL_LLM_SYSTEM_PROMPT=You are a helpful local AI assistant. Answer concisely. 
 ### Step 3: Build the frontend
 
 ```bash
-cd ~/_jackliu/app_project/jirou/website
+cd ~/jirou/website
 npm ci
 npm run build
 cd ..
@@ -121,7 +121,7 @@ cp -r website/dist src/kiro_crew/static/
 ### Step 4: Start the gateway
 
 ```bash
-cd ~/_jackliu/app_project/jirou
+cd ~/jirou
 KIROCREW_HOME=~/.kiro/jirou KIROCREW_PORT=5477 .venv/bin/kirocrew gateway
 ```
 
@@ -139,7 +139,7 @@ upstream → https://github.com/kirodotdev/KiroCrew   ← pull KiroCrew updates
 ### Syncing with upstream KiroCrew
 
 ```bash
-cd ~/_jackliu/app_project/jirou
+cd ~/jirou
 git fetch upstream
 git merge upstream/main
 ```
