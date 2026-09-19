@@ -92,8 +92,7 @@ def _unformatted(targets: tuple[str, ...]) -> set[str]:
     proc = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "black",
+            str(Path(__file__).with_name("bounded_black.py")),
             "--check",
             "--target-version",
             TARGET_VERSION,
@@ -109,7 +108,8 @@ def _unformatted(targets: tuple[str, ...]) -> set[str]:
     # former is a verdict; the latter must not read as "everything is clean".
     if proc.returncode not in (0, 1):
         sys.stderr.write(proc.stderr)
-        raise SystemExit(f"black failed with exit code {proc.returncode}")
+        sys.stderr.write(f"black failed with exit code {proc.returncode}\n")
+        raise SystemExit(123)
     found: set[str] = set()
     for line in proc.stderr.splitlines():
         match = WOULD_REFORMAT.match(line.strip())

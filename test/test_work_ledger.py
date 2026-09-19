@@ -1919,7 +1919,61 @@ def test_only_the_phase_2_seams_import_the_module():
 # ── maintenance ───────────────────────────────────────────────────────────
 
 
-def test_purge_conductor_removes_the_ledger_under_the_conductor_lock():
+def _pin_purge_clock(monkeypatch, directory, *, age):
+    """Evaluate age against the real census/mtime; leave parsing and locks intact."""
+    latest = wl._newest_activity(directory, wl.census_items(directory))
+    assert latest is not None
+    moment = latest + age
+
+    class EvaluationClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment.astimezone(tz) if tz else moment.astimezone().replace(tzinfo=None)
+
+    monkeypatch.setattr(wl, "datetime", EvaluationClock)
+    return latest
+
+
+@pytest.mark.parametrize("residue", [False, True], ids=["closed-item", "headerless-residue"])
+@pytest.mark.parametrize(
+    "age,idle_for,removed",
+    [
+        (timedelta(microseconds=-1), timedelta(0), False),
+        (timedelta(days=30, microseconds=-1), timedelta(days=30), False),
+        (timedelta(days=30), timedelta(days=30), True),
+        (timedelta(days=30, microseconds=1), timedelta(days=30), True),
+    ],
+    ids=["future-refused", "inside-window", "at-boundary", "past-boundary"],
+)
+def test_purge_retention_uses_actual_latest_activity(monkeypatch, residue, age, idle_for, removed):
+    if residue:
+        wl.ensure_conductor(CONDUCTOR, goal="g")
+        directory = wl.conductor_dir(CONDUCTOR)
+        (directory / "conductor.json").unlink()
+    else:
+        item_id = _new_item()
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+        directory = wl.conductor_dir(CONDUCTOR)
+    before = {
+        path.relative_to(directory): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    latest = _pin_purge_clock(monkeypatch, directory, age=age)
+    assert wl._newest_activity(directory, wl.census_items(directory)) == latest
+
+    if removed:
+        assert wl.purge_conductor(CONDUCTOR, allow_unreadable=residue, idle_for=idle_for) is True
+        assert not directory.exists()
+    else:
+        with pytest.raises(wl.WorkLedgerError, match="retention window") as caught:
+            wl.purge_conductor(CONDUCTOR, allow_unreadable=residue, idle_for=idle_for)
+        assert caught.value.code == wl.CODE_LEDGER_NOT_FINISHED
+        assert directory.is_dir()
+        assert {path: (directory / path).read_bytes() for path in before} == before
+
+
+def test_purge_conductor_removes_the_ledger_under_the_conductor_lock(monkeypatch):
     """The removal happens INSIDE the conductor lock, so nothing it deletes can be
     half-written by a ``goal`` or ``create`` holding that same lock.
 
@@ -1931,6 +1985,7 @@ def test_purge_conductor_removes_the_ledger_under_the_conductor_lock():
     wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
     directory = wl.conductor_dir(CONDUCTOR)
     assert (directory / "items" / f"{item_id}.json").exists()
+    _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
 
     real_lock = wl.conductor_lock
     inside: list[bool] = []
@@ -2035,13 +2090,14 @@ def test_census_reads_an_item_shaped_file_with_a_foreign_stem_as_unreadable():
     assert stray.exists()
 
 
-def test_purge_conductor_removes_a_headerless_itemless_residue_with_allow_unreadable():
+def test_purge_conductor_removes_a_headerless_itemless_residue_with_allow_unreadable(monkeypatch):
     """The no-items refusal is for a conductor WITH a header. A directory with
     neither -- the residue of a purge whose lock file could not go -- is damage,
     refused by a plain purge and removed when the caller asks."""
     wl.ensure_conductor(CONDUCTOR, goal="g")
     directory = wl.conductor_dir(CONDUCTOR)
     (directory / "conductor.json").unlink()
+    _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
 
     with pytest.raises(wl.WorkLedgerError) as caught:
         wl.purge_conductor(CONDUCTOR, allow_unreadable=False, idle_for=timedelta(0))
