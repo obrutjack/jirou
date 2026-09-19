@@ -2467,6 +2467,190 @@ class TestStop:
         # (which exits 1 here because no listener is found on 8089).
         assert "No Kiro Crew gateway" in capsys.readouterr().out
 
+    # ---- gateway.lock pid identity + the --pid override ---------------------
+
+    #: The macOS desktop app's spawn shape: a bare interpreter inside the
+    #: toolbox payload, which no ``_args_look_like_kirocrew`` pattern matches.
+    APP_ARGV = (
+        "/Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+        "kirocrew-backend-arm64/bin/python3.12 /Applications/KiroCrew.app/"
+        "Contents/Resources/backend-dist/kirocrew-backend-arm64/serve.py"
+    )
+
+    def _lock(self, pid, *, alive=True, source="recorded_pid"):
+        from kiro_crew.gateway_lock import LockHolder
+
+        return patch(
+            "kiro_crew.cli_server.lock_holder",
+            return_value=LockHolder(pid=pid, alive=alive, source=source),
+        )
+
+    def _lock_file(self, tmp_path, *, mode=0o600):
+        """A real ``gateway.lock`` in a patched config dir, at *mode*.
+
+        The lock's pid is identity only while nobody else could have written it,
+        so the permission check reads the real file rather than a mock.
+        """
+        path = tmp_path / "gateway.lock"
+        path.write_text("50519\n")
+        path.chmod(mode)
+        return patch("kiro_crew.cli_server.config_dir", return_value=tmp_path)
+
+    def _kill_patch(self):
+        """Patch the signal call the running OS takes, and return it."""
+        if sys.platform == "win32":
+            return patch(
+                "kiro_crew.cli_server.platform_compat.kill_process_tree", return_value=True
+            )
+        return patch("os.kill")
+
+    def test_argv_declines_the_app_spawn_shape(self):
+        """The premise of the tests below, asserted rather than assumed."""
+        from kiro_crew.cli_server import _args_look_like_kirocrew
+
+        assert _args_look_like_kirocrew(self.APP_ARGV) is False
+
+    def test_lock_pid_match_authorises_the_stop_argv_declined(self, capsys, tmp_path):
+        """gateway.lock naming the listener is identity the argv check cannot give.
+
+        The desktop app spawns a bare interpreter, so the argv patterns decline a
+        healthy gateway and ``stop`` refuses it. The gateway writes its own pid
+        into ``gateway.lock`` inside the 0700 data home, so a listener the live
+        lock holder names IS the gateway: it gets the ordinary SIGTERM, with
+        ``reason=lock_pid_match`` in the audit so the path stays separable.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._lock(50519),
+            self._lock_file(tmp_path),
+            patch("time.sleep"),
+            patch("kiro_crew.cli_server.platform_compat.pid_exists", return_value=False),
+            patch("kiro_crew.cli_server._stop_mcp_gateway_daemon"),
+            self._kill_patch() as mock_kill,
+        ):
+            _stop(5476)
+        out = capsys.readouterr().out
+        assert "50519" in out
+        assert "SIGTERM" in out or "Terminated" in out
+        assert "not recognised" not in out
+        mock_kill.assert_called_once()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        match = [r for r in reasons if "reason=lock_pid_match" in r]
+        assert len(match) == 1, reasons
+        # The record carries the evidence, not just the verdict.
+        for fact in ("pids=[50519]", "listener=yes", "lock_private=yes", "holder_alive=yes"):
+            assert fact in match[0]
+
+    def test_a_listener_the_lock_does_not_name_is_still_refused(self, capsys, tmp_path):
+        """Fact (a): the pid must be one of the listeners on this port.
+
+        A listener whose argv fails the check and whose pid is not the lock
+        holder's keeps the existing refusal and exit 1 -- the lock is evidence
+        about a single process, never a blanket permission to signal the port,
+        so the blast radius never leaves the port the command was pointed at.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._lock(4242),
+            self._lock_file(tmp_path),
+            self._kill_patch() as mock_kill,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        assert "not recognised" in capsys.readouterr().out
+        mock_kill.assert_not_called()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        assert any("reason=unrecognized_listener" in r for r in reasons)
+        assert not any("reason=lock_pid_match" in r for r in reasons)
+
+    def test_a_group_writable_lock_file_authorises_nothing(self, capsys, tmp_path):
+        """Fact (b): a lock another account could write is not identity.
+
+        The pid is a number in a file. With the group or world write bit set,
+        someone other than this account could have put it there, so the file
+        stops being evidence and the refusal stands.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._lock(50519),
+            self._lock_file(tmp_path, mode=0o660),
+            self._kill_patch() as mock_kill,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        assert "not recognised" in capsys.readouterr().out
+        mock_kill.assert_not_called()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        assert not any("reason=lock_pid_match" in r for r in reasons)
+
+    def test_a_holder_named_without_the_lock_file_authorises_nothing(self, capsys, tmp_path):
+        """Fact (c): the evidence has to come from the lock file itself.
+
+        ``home_anchor`` is the data home's own lock, reached only once
+        ``gateway.lock`` is gone. With no file there is nothing whose
+        permissions can be checked, so that holder names no identity here.
+        """
+        from kiro_crew.cli_server import _stop
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            self._lock(50519, source="home_anchor"),
+            self._lock_file(tmp_path),
+            self._kill_patch() as mock_kill,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        assert "not recognised" in capsys.readouterr().out
+        mock_kill.assert_not_called()
+        reasons = [c.kwargs["resources"] for c in mock_sel.log_api_access.call_args_list]
+        assert not any("reason=lock_pid_match" in r for r in reasons)
+
+    def test_an_indeterminate_lock_probe_authorises_nothing(self, capsys):
+        """A probe that cannot say who holds the lock names nobody.
+
+        The pid the file records may belong to a process that reused the number,
+        so the refusal stands rather than signalling on a guess.
+        """
+        from kiro_crew.cli_server import _stop
+        from kiro_crew.gateway_lock import LockProbeError
+
+        with (
+            self._mock_sel(),
+            self._ports([50519]),
+            self._cmdline(self.APP_ARGV),
+            patch(
+                "kiro_crew.cli_server.lock_holder",
+                side_effect=LockProbeError(Path("gateway.lock"), OSError("unreadable")),
+            ),
+            self._kill_patch() as mock_kill,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        assert "not recognised" in capsys.readouterr().out
+        mock_kill.assert_not_called()
+
 
 class TestWaitForPidsExit:
     """Tests for the bounded ``_wait_for_pids_exit`` helper."""
@@ -2564,6 +2748,13 @@ class TestRestart:
 
     def _mock_sel(self):
         return patch("kiro_crew.cli_server.sel", return_value=MagicMock())
+
+    def _lock_file(self, tmp_path, *, mode=0o600):
+        """A real ``gateway.lock`` in a patched config dir (see ``TestStop``)."""
+        path = tmp_path / "gateway.lock"
+        path.write_text("50519\n")
+        path.chmod(mode)
+        return patch("kiro_crew.cli_server.config_dir", return_value=tmp_path)
 
     def test_service_active_restarts_via_controller(self, capsys):
         from kiro_crew.cli_server import _restart
@@ -3348,6 +3539,104 @@ class TestRestart:
         # And we should have fallen through to the spawn path.
         mock_spawn.assert_called_once()
         assert "Started detached gateway" in capsys.readouterr().out
+
+    def test_restart_waits_for_the_gateway_the_lock_named(self, capsys, tmp_path):
+        """Restart must outwait the pid ``_stop`` stopped on lock identity.
+
+        The app-spawned gateway fails the argv check, so it is no incumbent by
+        that route; asking the lock only afterwards would refuse the very gateway
+        the stop just signalled and start no replacement. The lock names it up
+        front, restart waits for it, and the replacement spawns.
+        """
+        from kiro_crew.cli_server import _restart
+        from kiro_crew.gateway_lock import LockHolder
+
+        app_argv = (
+            "/Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+            "kirocrew-backend-arm64/bin/python3.12 /Applications/KiroCrew.app/"
+            "Contents/Resources/backend-dist/kirocrew-backend-arm64/serve.py"
+        )
+        held = LockHolder(pid=50519, alive=True, source="recorded_pid")
+        free = LockHolder(pid=None, alive=False, source="none")
+        with (
+            self._mock_sel(),
+            self._lock_file(tmp_path),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[50519],
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.process_command_line",
+                return_value=app_argv,
+            ),
+            # Held while the stop runs; released by the pre-spawn probe.
+            patch("kiro_crew.cli_server.lock_holder", side_effect=[held, free]),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server.os.kill") as mock_kill,
+            patch("kiro_crew.cli_server._stop_mcp_gateway_daemon"),
+            patch("time.sleep"),
+            patch("kiro_crew.cli_server.platform_compat.pid_exists", return_value=False),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", return_value=[]) as mock_wait,
+            patch("kiro_crew.cli_server.run_marker.read_pid", return_value=None),
+            patch(
+                "kiro_crew.cli_server._spawn_detached_gateway",
+                return_value=self._fake_proc(60815),
+            ) as mock_spawn,
+        ):
+            _restart(5476)
+        mock_kill.assert_called_once()
+        assert mock_wait.call_args.args[0] == [50519]
+        mock_spawn.assert_called_once()
+        assert "does not look like a Kiro Crew gateway" not in capsys.readouterr().out
+
+    def test_restart_waits_for_every_pid_the_stop_signalled(self, capsys, tmp_path):
+        """A mixed port: one recognised listener plus one the lock names.
+
+        The argv filter names only the recognised pid, so a wait derived from it
+        misses the lock-authorised one -- which ``_stop`` did signal and which
+        still owns gateway.lock while it tears down. The replacement would then
+        be refused and nothing would serve. Restart waits for both because
+        ``_stop`` reports what it signalled.
+        """
+        from kiro_crew.cli_server import _restart
+        from kiro_crew.gateway_lock import LockHolder
+
+        app_argv = (
+            "/Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+            "kirocrew-backend-arm64/bin/python3.12 /Applications/KiroCrew.app/"
+            "Contents/Resources/backend-dist/kirocrew-backend-arm64/serve.py"
+        )
+        held = LockHolder(pid=50519, alive=True, source="recorded_pid")
+        free = LockHolder(pid=None, alive=False, source="none")
+        with (
+            self._mock_sel(),
+            self._lock_file(tmp_path),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[1234, 50519],
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.process_command_line",
+                side_effect=lambda pid: (
+                    "python3 -m kiro_crew gateway" if pid == 1234 else app_argv
+                ),
+            ),
+            patch("kiro_crew.cli_server.lock_holder", side_effect=[held, free]),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server.os.kill"),
+            patch("kiro_crew.cli_server._stop_mcp_gateway_daemon"),
+            patch("time.sleep"),
+            patch("kiro_crew.cli_server.platform_compat.pid_exists", return_value=False),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", return_value=[]) as mock_wait,
+            patch("kiro_crew.cli_server.run_marker.read_pid", return_value=None),
+            patch(
+                "kiro_crew.cli_server._spawn_detached_gateway",
+                return_value=self._fake_proc(60815),
+            ) as mock_spawn,
+        ):
+            _restart(5476)
+        assert mock_wait.call_args.args[0] == [1234, 50519]
+        mock_spawn.assert_called_once()
 
 
 class TestRestartReadinessVerdict:

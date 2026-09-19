@@ -1256,6 +1256,26 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
    `stop` names the pid(s) — with the cmdline basename when cheap — and exits 1 with SEL
    `reason=unrecognized_listener`, rather than reporting "no gateway running" for a port
    that is occupied.
+   Before that refusal, each declined pid is offered to `_lock_authorized_pids`, which
+   answers with the pids `gateway.lock` identifies as the gateway — the app-spawned shape
+   the argv patterns never learn is the population this exists for. The gateway writes its
+   own pid into that file, so the match is identity supplied BY the gateway rather than
+   inferred from a command line; a pid in a file is not identity on its own, so all three
+   of these must hold before it authorises the ordinary graceful stop:
+   the pid is one of the listeners the port lookup reported on the resolved port (so the
+   blast radius cannot leave the port this command was pointed at); `gateway.lock` is
+   owned by this account with no group or world write bit, so no other account could have
+   planted the pid it records (POSIX only — Windows permissions are an ACL those bits
+   cannot describe, so the evidence counts as unavailable there); and the lock is
+   positively held right now by that live pid, which `lock_holder` establishes by probing
+   the flock rather than by reading the file, reporting a held lock whose acquirer it
+   cannot name as indeterminate rather than as a holder. Any one of them missing keeps the
+   refusal — including a holder named through the home anchor, which is reached only once
+   the lock file is gone and so has no permissions to check. The authorised case is
+   audited SEL `reason=lock_pid_match` carrying those three facts, not just the verdict.
+   `_stop` returns the pids it signalled and `restart` waits for exactly those, so a
+   gateway stopped on lock identity is never missing from that wait and then refused by
+   the lock question that follows an empty incumbent list.
 4. Terminate each verified PID: `os.kill(SIGTERM)` on POSIX; `taskkill /T /F`
    (via `platform_compat.kill_process_tree`) on Windows so the gateway's detached
    children are reaped too. Liveness is probed with `platform_compat.pid_exists`

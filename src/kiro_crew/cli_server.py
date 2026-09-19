@@ -14,6 +14,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -408,7 +409,89 @@ def _terminal_safe_name(name: str) -> str:
     return "".join(ch for ch in name if ch.isprintable())[:_MAX_ECHOED_NAME_LEN]
 
 
-def _stop(cli_port: int | None = None) -> None:
+#: Lock surfaces whose pid came from ``gateway.lock`` itself. ``home_anchor`` is
+#: the data home's own lock, reached only once the lock FILE is gone -- with no
+#: file there is nothing to check the permissions of, so it names no identity.
+_LOCK_FILE_SOURCES = ("flock_owner", "recorded_pid")
+
+
+def _lock_file_is_account_private(path: Path) -> bool:
+    """Could only THIS account have written *path*?
+
+    The pid in ``gateway.lock`` is a number in a file, so it is identity only
+    while nobody else could have put it there. Owner must be this account and
+    the group/other write bits must be clear; the enclosing data home is 0700,
+    and this is the file's own half of that.
+
+    POSIX only. Off POSIX the mode triples describe nothing -- permissions are
+    an ACL there -- so the answer is "cannot tell", which for an authorisation
+    input rounds to ``False``: unavailable evidence is not evidence, and the
+    caller then keeps the refusal it would have made anyway.
+    """
+    if not platform_compat.IS_POSIX:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if st.st_uid not in (os.getuid(), os.geteuid()):
+        return False
+    return not bool(st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _lock_authorized_pids(operation: str, port: int, listeners: list[int]) -> list[int]:
+    """Return the *listeners* ``gateway.lock`` identifies as the gateway.
+
+    :func:`_is_kirocrew_process` reads argv, so every spawn shape has to be
+    taught to it and an unknown one reads as foreign -- an app-spawned gateway
+    among them. ``gateway.lock`` needs no pattern list: the gateway writes its
+    own pid there. But a pid in a file is not identity by itself, so all three
+    of these must hold before it authorises the ordinary graceful stop:
+
+    (a) the pid is one of the processes the port lookup reported LISTENING on
+        the resolved port -- *listeners* IS that list, so a lock naming
+        anything else authorises nothing, and the blast radius can never leave
+        the port this command was pointed at;
+    (b) ``gateway.lock`` is owned by this account with no group or world write
+        bit (:func:`_lock_file_is_account_private`), so no other account could
+        have planted the pid it records;
+    (c) the lock is positively HELD right now by that live pid --
+        :func:`lock_holder` probes the flock rather than reading the file, and
+        reports a held lock whose acquirer it cannot name as indeterminate
+        rather than as a holder, so a stale or reused number is not a holder.
+
+    Any one of them missing leaves the caller's existing refusal in place. The
+    authorised case is audited ``reason=lock_pid_match`` with the three facts,
+    so the SEL record carries the evidence and not just the verdict.
+    """
+    if not listeners:
+        return []
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError:
+        return []
+    if holder.pid is None or not holder.alive or holder.source not in _LOCK_FILE_SOURCES:
+        return []
+    matched = [p for p in listeners if p == holder.pid]
+    if not matched:
+        return []
+    if not _lock_file_is_account_private(config_dir() / "gateway.lock"):
+        return []
+    sel().log_api_access(
+        caller="cli",
+        operation=operation,
+        outcome="allowed",
+        source="cli",
+        resources=(
+            f"pids={matched} port={port} reason=lock_pid_match "
+            f"listener=yes lock_private=yes holder_alive=yes "
+            f"holder_source={holder.source}"
+        ),
+    )
+    return matched
+
+
+def _stop(cli_port: int | None = None) -> list[int]:
     """Stop a running KiroCrew gateway.
 
     Accepts the raw CLI ``--port`` value (``None`` when not passed).
@@ -419,6 +502,14 @@ def _stop(cli_port: int | None = None) -> None:
     - ``cli_port is not None``: user explicitly targeted a port, so we
       bypass the service short-circuit and SIGTERM the gateway bound to
       that port directly.
+
+    Returns the pids it signalled, so :func:`_restart` waits for the processes
+    this stop actually acted on instead of re-deriving them from a second
+    lookup: a lock-authorised target is invisible to the argv filter, and a pid
+    nobody waits for can still own ``gateway.lock`` when the replacement spawns
+    -- which is a replacement refused at once and no gateway left. Empty when
+    the stop went through the service manager or the authenticated shutdown
+    API, neither of which names a pid.
     """
     port = resolve_client_port(cli_port)
     if cli_port is None and service_controller.stop_service():
@@ -431,7 +522,7 @@ def _stop(cli_port: int | None = None) -> None:
         )
         print("✅ Stopped kirocrew service. To remove it: kirocrew service uninstall")
         _stop_mcp_gateway_daemon()
-        return
+        return []
 
     # Cross-platform port -> listening PID lookup (lsof on POSIX, netstat -ano
     # on Windows — there is no lsof there, so an lsof-only lookup makes
@@ -445,7 +536,7 @@ def _stop(cli_port: int | None = None) -> None:
         # tool diagnostic is reserved for the case where nothing else found a
         # gateway either. Graceful API first -- it signals no guessed pid.
         if _report_authenticated_shutdown(port):
-            return
+            return []
         # The port probe found nothing, but the port probe is not how a gateway
         # is actually kept single-instance — the gateway.lock flock is (see
         # gateway_lock.py). A gateway bound to a unix socket only, or one whose
@@ -521,6 +612,15 @@ def _stop(cli_port: int | None = None) -> None:
     # recycled. Acceptable risk for an interactive CLI tool with low blast radius.
     unrecognized = [p for p in pids if not _is_kirocrew_process(p)]
     pids = [p for p in pids if _is_kirocrew_process(p)]
+    if unrecognized:
+        # argv is not the only identity evidence. gateway.lock carries the pid
+        # the gateway wrote itself, so a declined listener the lock names IS the
+        # gateway however its command line reads -- the app-spawned shapes the
+        # argv patterns never learn land here. The lock's own conditions are in
+        # _lock_authorized_pids; anything short of all three refuses below.
+        adopted = _lock_authorized_pids("gateway_stop", port, unrecognized)
+        pids += adopted
+        unrecognized = [p for p in unrecognized if p not in adopted]
     if not pids:
         # Something holds the port, but nothing on it classifies as a Kiro Crew
         # gateway. Reporting "no gateway running" here is misleading — the port
@@ -631,6 +731,7 @@ def _stop(cli_port: int | None = None) -> None:
         )
         print(f"No Kiro Crew gateway currently running on port {port} (process already exited).")
         sys.exit(1)
+    return sorted(sent)
 
 
 def _manual_stop_command(pid: int) -> str:
@@ -1234,12 +1335,19 @@ def _restart(cli_port: int | None = None) -> None:
         # case is re-read from the lock below, so the swallow does not turn a
         # refusal into a spawn.
         stop_returned = False
+        signalled: list[int] = []
         try:
-            _stop(cli_port)
+            signalled = _stop(cli_port)
             stop_returned = True
         except SystemExit:
             pass
         wait_for_incumbents = True
+        # Wait for what the stop SIGNALLED, not for what the argv filter above
+        # named. A lock-authorised listener is invisible to that filter, and
+        # _stop's own lookup can differ from this one, so a pid missing here is
+        # a pid still holding gateway.lock when the replacement spawns --
+        # stopped gateway, refused replacement, nothing serving.
+        incumbents = sorted(set(incumbents) | set(signalled))
         if not incumbents:
             # The port lookup named nobody to wait for. If _stop returned, a
             # gateway acknowledged the authenticated shutdown (the one path that
