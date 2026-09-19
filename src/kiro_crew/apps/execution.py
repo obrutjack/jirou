@@ -620,6 +620,54 @@ def repository_bound_grant_denied(
     )
 
 
+def _execution_admission(
+    app_name: str,
+    *,
+    app_root: Path | None = None,
+    repository: str | None = None,
+) -> tuple[str | None, str]:
+    """Decide execution admission for *app_name*, and nothing else.
+
+    Returns ``(denial_reason, provenance)``; a reason of ``None`` is an
+    admission. No audit row, no logging, no side effect of any kind — the
+    decision only.
+
+    Split out so its two callers cannot drift apart.
+    :func:`app_execution_denied` is this plus the SEL admission row, and is what
+    every surface about to run code must use. :func:`third_party_ceiling_closed`
+    is this WITHOUT the row, for a poller that re-asks the same question about an
+    already-running backend every few seconds. Restating the decision in the
+    poller instead would let the two answers diverge, and on this boundary a
+    divergence means a backend still executing under a ceiling the operator
+    believes is closed — the exact failure the ceiling exists to prevent.
+    """
+    builtin = is_builtin_app(app_name=app_name, app_root=app_root)
+    name_granted = not builtin and app_name in trusted_app_names()
+    repository_denied = (
+        repository_bound_grant_denied(app_name, repository=repository)
+        if name_granted
+        else None
+    )
+    granted = name_granted and repository_denied is None
+    if builtin:
+        provenance = "provenance=shipped_builtin"
+    elif granted:
+        provenance = "provenance=trusted_grant"
+    elif name_granted:
+        provenance = "provenance=trusted_grant_repository_mismatch"
+    else:
+        provenance = "provenance=unverified"
+    if builtin or granted or third_party_execution_allowed():
+        return None, provenance
+
+    reason = repository_denied or (
+        "third-party app execution is disabled; trust this app alone in Settings "
+        f"({_TRUST_SETTING_PATH}), or set {_ALLOW_ALL_SETTING_PATH}=true to allow "
+        "every third-party app's Python, backend, and manifest shell code"
+    )
+    return reason, provenance
+
+
 def app_execution_denied(
     app_name: str,
     *,
@@ -639,24 +687,15 @@ def app_execution_denied(
     the independently resolved installed provenance (at runtime). Allowed and
     denied decisions are audited best-effort, but audit unavailability never
     changes the execution decision.
+
+    The decision itself lives in :func:`_execution_admission`; this is that
+    decision plus its audit row. Use THIS at every surface that is about to run
+    code, so the admission or the refusal is recorded.
     """
-    builtin = is_builtin_app(app_name=app_name, app_root=app_root)
-    name_granted = not builtin and app_name in trusted_app_names()
-    repository_denied = (
-        repository_bound_grant_denied(app_name, repository=repository)
-        if name_granted
-        else None
+    reason, provenance = _execution_admission(
+        app_name, app_root=app_root, repository=repository
     )
-    granted = name_granted and repository_denied is None
-    if builtin:
-        provenance = "provenance=shipped_builtin"
-    elif granted:
-        provenance = "provenance=trusted_grant"
-    elif name_granted:
-        provenance = "provenance=trusted_grant_repository_mismatch"
-    else:
-        provenance = "provenance=unverified"
-    if builtin or granted or third_party_execution_allowed():
+    if reason is None:
         try:
             sel().log_api_access(
                 caller=caller,
@@ -668,11 +707,6 @@ def app_execution_denied(
             logger.debug("app execution admission audit failed", exc_info=True)
         return None
 
-    reason = repository_denied or (
-        "third-party app execution is disabled; trust this app alone in Settings "
-        f"({_TRUST_SETTING_PATH}), or set {_ALLOW_ALL_SETTING_PATH}=true to allow "
-        "every third-party app's Python, backend, and manifest shell code"
-    )
     try:
         sel().log_api_access(
             caller=caller,
@@ -683,4 +717,29 @@ def app_execution_denied(
         )
     except Exception:  # noqa: BLE001 - denial must survive audit unavailability
         logger.debug("app execution denial audit failed", exc_info=True)
+    return reason
+
+
+def third_party_ceiling_closed(
+    app_name: str, *, app_root: Path | None = None
+) -> str | None:
+    """Denial reason when an ALREADY-RUNNING app is no longer admitted to execute.
+
+    The same decision as :func:`app_execution_denied`, read from the same
+    :func:`_execution_admission` core, and deliberately WITHOUT its audit row.
+
+    The caller is a poller, not an admission point: the per-backend liveness
+    watch re-asks this about every live third-party backend every
+    ``_HEALTH_WATCH_INTERVAL`` seconds. An ``allowed`` row per app per sweep
+    would add thousands of rows a day whose whole content is "nothing changed",
+    burying the admissions the audit trail exists to show — the ones taken at a
+    module load, a backend spawn, or an enable. Nothing is being authorised here;
+    something already running is being re-examined.
+
+    A DENIAL from here is never silent. A caller that acts on the reason audits
+    through :func:`app_execution_denied` at the point it acts, so a revocation
+    writes exactly the row the gate writes. Only the unchanged answer goes
+    unrecorded.
+    """
+    reason, _provenance = _execution_admission(app_name, app_root=app_root)
     return reason

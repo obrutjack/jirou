@@ -40,6 +40,7 @@ from kiro_crew.apps.execution import (
     is_builtin_app,
     shipped_builtin_app_root,
     shipped_builtin_module_path,
+    third_party_ceiling_closed,
 )
 from kiro_crew.apps.interpreter import app_deps_dir, path_command_is_abi_matched, resolve_app_python
 from kiro_crew.apps.manager import (
@@ -3611,6 +3612,107 @@ def _watch_backend_health(ap: AppProcess, health_path: str) -> None:
                     return  # not the tracked record — nothing left to watch
 
 
+def _revoke_if_ceiling_closed(ap: AppProcess) -> bool:
+    """Stop *ap* when its app is no longer admitted to execute. True when stopped.
+
+    Turning ``agent.apps_allow_third_party`` off is supposed to stop the code it
+    was admitting, and the dashboard endpoint does exactly that on its falling
+    edge. But that endpoint is not the only way the setting goes false: the CLI
+    writes the same config, and so does a text editor — the publishing guide used
+    to teach the file as THE place to set it. Neither route runs the sweep, and
+    the boot reconcile in :func:`start_enabled_app_backends` only revokes at the
+    NEXT start. In between, a backend admitted solely by the blanket flag kept
+    serving under a ceiling the operator had already closed: trust withdrawn on
+    paper only, which is the one failure this control exists to prevent.
+
+    This watch is the only thing that already revisits every live backend, so
+    enforcing here adds no task, no interval, and no setting — a closed ceiling
+    now stops the process within one sweep whatever route closed it.
+
+    Scope is the EXECUTING surface and stops there. An app holding its own
+    ``agent.apps_trusted`` grant is untouched: that permission is independent of
+    the blanket flag. Builtins are exempt at the gate on shipped provenance.
+    Non-executable derivative resources — agents, skills, MCP declarations, cron
+    definitions — are outside the ceiling by contract and are left to the
+    lifecycle lock's owners; a cron or hook that tries to RUN app code still
+    meets ``app_execution_denied`` and fails closed on its own.
+
+    No ``on_shutdown`` hook is attempted, and that is not an oversight. The flag
+    is already false by the time this observes it, so ``load_app_module`` refuses
+    to load the hook — the same state the endpoint's post-write second pass
+    documents. Pretending to run it would report a teardown that could not
+    happen.
+
+    Never raises: the enclosing sweep is wrapped, but a fault here would cost the
+    liveness watch that other code depends on, so a failed revocation is logged
+    and retried on the next sweep instead.
+    """
+    name = ap.app_name
+    try:
+        # Same POPULATION as the endpoint's falling-edge sweep, which enumerates
+        # `list_apps()`: an app with no readable installed record is not this
+        # mechanism's business. A record can be absent because the app was
+        # uninstalled — uninstall runs its own teardown — or unreadable, and in
+        # both cases the endpoint's sweep cannot see it either, so matching it
+        # here keeps one blind spot rather than inventing a second behaviour.
+        # It is not a hole: `app_execution_denied` still refuses every new load,
+        # spawn and lifecycle command for that app.
+        if _read_installed(name) is None:
+            return False
+        if third_party_ceiling_closed(
+            name, app_root=shipped_builtin_app_root(name)
+        ) is None:
+            return False
+        # Audited through the gate itself, ONCE, at the point of acting: the poll
+        # above deliberately writes no row (see third_party_ceiling_closed), so this
+        # is what puts the revocation in the audit trail, with the gate's own reason.
+        reason = app_execution_denied(
+            name,
+            action="health_watch_ceiling_revocation",
+            app_root=shipped_builtin_app_root(name),
+            caller="gateway",
+        )
+        logger.warning(
+            "App %s: third-party execution is no longer permitted; stopping its "
+            "backend on port %d — %s",
+            name, ap.port, reason,
+        )
+        # `_expected` so a record that was replaced between the sweep's identity
+        # check and here is not stopped on its predecessor's evidence.
+        stopped = stop_app_backend(name, _expected=ap)
+        with _lock:
+            still_tracked = _processes.get(name) is ap
+        if still_tracked:
+            # `stop_app_backend` RESTORES tracking for an ADOPTED backend whose PIDs
+            # it will not signal — it cannot name the process, so it refuses and
+            # leaves the record in place specifically so the stop can be retried.
+            # Exiting here would abandon exactly that record: un-trusted code still
+            # serving, nothing retrying the revocation, nothing watching its
+            # liveness. Keep sweeping instead, one attempt per interval — the same
+            # shape the exited-backend branch below uses — and let the denial row
+            # repeat, because "code the operator un-trusted is still running" is a
+            # fact that stays true until it is not.
+            logger.warning(
+                "App %s: could not stop a backend the ceiling no longer admits; "
+                "retrying next sweep",
+                name,
+            )
+            return False
+        if not stopped:
+            logger.warning(
+                "App %s: backend record was already gone when the closed ceiling "
+                "was enforced; nothing left to stop",
+                name,
+            )
+        return True
+    except Exception:  # noqa: BLE001 - see the docstring; a dead watch is worse
+        logger.warning(
+            "App %s: could not act on a closed execution ceiling; retrying next sweep",
+            name, exc_info=True,
+        )
+        return False
+
+
 def _watch_backend_health_sweeps(ap: AppProcess, health_path: str) -> None:
     """Keep re-checking an already-healthy backend so ``healthy`` can go back to False.
 
@@ -3647,6 +3749,11 @@ def _watch_backend_health_sweeps(ap: AppProcess, health_path: str) -> None:
             was_healthy = ap.healthy
             mcp_healthy = ap.mcp_healthy
             proc = ap.proc
+
+        # Re-read the execution ceiling before judging health, because a backend the
+        # operator is no longer admitting must stop whether it is healthy or not.
+        if _revoke_if_ceiling_closed(ap):
+            return
 
         if proc is not None and proc.poll() is not None:
             # A dead Popen never revives, so there is no health verdict left to reach —
