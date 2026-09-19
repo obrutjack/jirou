@@ -5376,7 +5376,25 @@ class KiroCrewConfig:
         KiroCrew is KiroACP-only: the sole provider is the ACP adapter driving
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
+
+        Fork extension: when ``agent.provider`` is ``"local-llm"``,
+        returns a ``LocalLLMProvider`` factory instead.  This covers
+        LM Studio, Ollama and any BYOK cloud endpoint without touching the ACP
+        layer.  See ``src/kiro_crew/providers/local_llm.py`` for details.
         """
+        # ── Fork extension: local-llm provider ──────────────────────────
+        if self.agent.provider == "local-llm":
+            from kiro_crew.providers.local_llm import LocalLLMProvider
+
+            def _local_llm(
+                session_key: str | None = None,
+                **_kwargs: object,
+            ) -> LocalLLMProvider:
+                return LocalLLMProvider(session_key=session_key)
+
+            return _local_llm
+        # ── /Fork extension ────────────────────────────────────────────────────
+
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
