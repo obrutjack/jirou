@@ -75,6 +75,12 @@ function card(
     operator_notes: string[]
     tool_approval: string
     offered_by_build: boolean
+    mcp: {
+      projection: string
+      per_tool_deny: string
+      withheld: string[]
+      no_channel: string[]
+    }
   }> = {},
 ) {
   return {
@@ -87,6 +93,33 @@ function card(
     tool_approval: 'agent_spec',
     offered_by_build: true,
     ...over,
+  }
+}
+
+/**
+ * The MCP half of a card, defaulted to the dull answer: projected by a mirror, a
+ * tool-off that stays per tool, nothing withheld.
+ *
+ * Deliberately NOT part of `card()`'s default. A gateway that predates the field
+ * sends no `mcp` at all, so the uninteresting row is the one that carries none and
+ * every test below opts in to the half it is about — the same arrangement as `auth`.
+ */
+function mcp(
+  over: Partial<{
+    projection: string
+    per_tool_deny: string
+    withheld: string[]
+    no_channel: string[]
+  }> = {},
+) {
+  return {
+    mcp: {
+      projection: 'mirror',
+      per_tool_deny: 'settings-file',
+      withheld: [] as string[],
+      no_channel: [] as string[],
+      ...over,
+    },
   }
 }
 
@@ -108,6 +141,12 @@ function probeRow(
     operator_notes: string[]
     tool_approval: string
     offered_by_build: boolean
+    mcp: {
+      projection: string
+      per_tool_deny: string
+      withheld: string[]
+      no_channel: string[]
+    }
   }> = {},
 ) {
   return {
@@ -1432,6 +1471,164 @@ describe('AgentBackendTab detail card', () => {
       expect(screen.getByText('Kiro CLI supports 1 of 2 features')).toBeInTheDocument(),
     )
     expect(screen.queryByRole('tab', { name: 'Claude Code' })).toBeNull()
+  })
+})
+
+describe('AgentBackendTab MCP ability card', () => {
+  /**
+   * The half a capability set cannot answer: what happens to the user's own agent
+   * FILE on the way to this harness. Every line of it is projected on the server
+   * from the declaration `providers/mirrors/registry.py` carries, which nothing
+   * rendered before this card: a declaration with no reader is not a feature.
+   *
+   * It DECLARES. Per-tool MCP deny is not a requirement on every agent, so no test
+   * here asserts that any agent enforces one — two of them cannot, and the card's
+   * job is to say which form a reader is getting before a session runs.
+   */
+
+  it('states the delivery kind in the summary, without a click', async () => {
+    // The kind decides whether the rest matters, so it must be readable without
+    // opening anything. The per-concern detail is what a reader opens for.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', { ...card(), ...mcp({ projection: 'native' }) })],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    const summary = await screen.findByText(/MCP servers from your agent file/)
+    expect(summary.textContent).toContain('this agent reads the file itself')
+    // A native `<details>`/`<summary>`: keyboard reachable, searchable in the page
+    // and open on print, with no focus management of ours to get wrong.
+    expect(summary.tagName.toLowerCase()).toBe('summary')
+    expect(summary.closest('details')).not.toBeNull()
+  })
+
+  it('says a tool-off withholds the whole server on an agent that has no per-tool channel', async () => {
+    // THE line this card exists for, and the maintainer's ruling made visible:
+    // per-tool `mcp.deny` is not a hard requirement, so an agent without a per-call
+    // deny channel declares the whole-server form instead of enforcing one. Switching
+    // a tool off is an ordinary action that says nothing about servers, so an operator
+    // meets the difference by accident unless the card states it first.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', { ...card(), ...mcp() }),
+        probeRow('opencode', {
+          ...card(),
+          ...mcp({ per_tool_deny: 'whole-server', withheld: ['permission_mode'] }),
+        }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'opencode']))
+    wrap()
+    await waitFor(() => expect(row('opencode')).toBeInTheDocument())
+    highlight('opencode')
+    const line = panel().getByText(/removes the whole server from this agent/)
+    expect(line.textContent).toContain('Kiro Crew')
+    // And the harness that DOES carry a per-tool channel says the opposite, so the
+    // two are distinguishable rather than both reading as a warning.
+    highlight('Kiro CLI')
+    expect(panel().getByText(/turns off that tool/)).toBeInTheDocument()
+    expect(panel().queryByText(/removes the whole server/)).toBeNull()
+  })
+
+  it('separates what is not sent from what has no channel yet', async () => {
+    // The split IS the meaning: a withhold is a settled decision with a reason, a
+    // no-channel is a gap the transport cannot carry today. Collapsing them would
+    // tell a reader the two are the same answer.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', {
+          ...card(),
+          ...mcp({ withheld: ['auto_approve', 'permission_mode'], no_channel: ['hooks'] }),
+        }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(panel().getByText('Deliberately not sent')).toBeInTheDocument())
+    expect(panel().getByText('Auto-approve')).toBeInTheDocument()
+    expect(
+      panel().getByText('The permission mode your agent file asks for'),
+    ).toBeInTheDocument()
+    expect(panel().getByText('No channel for these yet')).toBeInTheDocument()
+    expect(panel().getByText('The hooks your agent file defines')).toBeInTheDocument()
+  })
+
+  it('renders no heading for a list that is empty', async () => {
+    // Stated only where it holds, like every other note on this card: a heading with
+    // nothing under it reads as a fact the reader has to go and check.
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', { ...card(), ...mcp() })] })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() =>
+      expect(screen.getByText(/MCP servers from your agent file/)).toBeInTheDocument(),
+    )
+    expect(screen.queryByText('Deliberately not sent')).toBeNull()
+    expect(screen.queryByText('No channel for these yet')).toBeNull()
+  })
+
+  it('says nothing at all when the gateway sent no mcp group', async () => {
+    // A gateway that predates the field, a 403, a query in flight. Absent probe
+    // information is not a verdict, and this card says nothing it was not told.
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('', card())] })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() =>
+      expect(screen.getByText('Kiro Crew tools work in the chat')).toBeInTheDocument(),
+    )
+    expect(screen.queryByText(/MCP servers from your agent file/)).toBeNull()
+  })
+
+  it('says nothing for a kind this frontend has no label for', async () => {
+    // Same rule as a capability id with no label, and the same reason: a raw
+    // `teleported` in front of a reader is worse than one line fewer. The server
+    // answers an UNDECLARED agent with `''`, which lands here too — and saying
+    // nothing is right there, because guessing is the invisible-difference failure
+    // the mirror declarations exist to stop.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('', { ...card(), ...mcp({ projection: 'teleported' }) })],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() =>
+      expect(screen.getByText('Kiro Crew tools work in the chat')).toBeInTheDocument(),
+    )
+    expect(screen.queryByText(/MCP servers from your agent file/)).toBeNull()
+  })
+
+  it('skips a concern id this frontend has no label for', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', {
+          ...card(),
+          ...mcp({ withheld: ['auto_approve', 'some_future_concern'] }),
+        }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['']))
+    wrap()
+    await waitFor(() => expect(panel().getByText('Auto-approve')).toBeInTheDocument())
+    expect(screen.queryByText('some_future_concern')).toBeNull()
+  })
+
+  it('shows the card for the harness on screen and no other', async () => {
+    // Highlight is not selection, and the MCP half follows the same rule as the
+    // capability half: one card at a time, so the reader can compare by arrowing.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('', { ...card(), ...mcp({ projection: 'native', per_tool_deny: '' }) }),
+        probeRow('opencode', { ...card(), ...mcp({ per_tool_deny: 'whole-server' }) }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['', 'opencode']))
+    wrap()
+    await waitFor(() => expect(row('opencode')).toBeInTheDocument())
+    expect(screen.getByText(/this agent reads the file itself/)).toBeInTheDocument()
+    expect(screen.queryByText(/removes the whole server/)).toBeNull()
+    highlight('opencode')
+    expect(panel().getByText(/removes the whole server/)).toBeInTheDocument()
+    expect(screen.queryByText(/this agent reads the file itself/)).toBeNull()
+    // Reading a card wrote nothing: the Use button is the only control that switches.
+    expect(patchConfigMock).not.toHaveBeenCalled()
   })
 })
 

@@ -1473,6 +1473,88 @@ def _doctor_selected_backend_projection(cfg: KiroCrewConfig) -> None:
     _print_wrapped(f"Tracked at: {_safe_display(tracking)}")
 
 
+def _doctor_backend_ability_cards() -> None:
+    """One MCP ability row per SELECTABLE backend, before anything is chosen.
+
+    The rows above answer for the harness the operator already configured, and only
+    when something is wrong with it. This answers the question they ask BEFORE
+    switching: these harnesses are not interchangeable, and every way they differ
+    over the agent spec has until now lived in source, in a spec document, or in a
+    log line nobody reads. The dashboard's agent-backend panel carries the same card
+    for a reader who has a browser; the users most likely to meet a projection gap
+    are the ones already in a terminal diagnosing it, which is why it is here too.
+
+    One line each, and the whole line is derived from
+    ``agent_sdk.backend_mcp_ability`` -- the projection KIND, the reach of a
+    per-tool MCP restriction, and the spec keys this harness withholds or has no
+    channel for. Nothing is authored per harness, so a newly onboarded backend gets
+    a row here the moment its ``PROJECTIONS`` entry exists.
+
+    Reports only, and appends NO entry to ``issues``, on the terms every row in this
+    neighbourhood sets: a declared difference between harnesses is what the
+    declaration is FOR, and failing doctor's exit code on one would make choosing a
+    harness read as a fault. It declares; it changes nothing and gates nothing.
+
+    Asks ``agent_sdk`` rather than reading ``providers/mirrors`` here, for the reason
+    every other backend question in this module does: the declaration lives below the
+    boundary and reaching it from a consumer would take an edge the
+    agent-sdk-boundary gate refuses.
+    """
+    from kiro_crew.acp_backends import selectable_backend_values
+    from kiro_crew.agent_sdk.backend_mcp_ability import ability_for, spec_keys
+
+    try:
+        rows = [(backend, ability_for(backend)) for backend in selectable_backend_values()]
+        keys = spec_keys()
+    except Exception:
+        # Triage must survive an unreadable registry; the rows are advisory.
+        return
+    if not rows:
+        return
+    print("  mcp ability:")
+    for backend, ability in rows:
+        label = _backend_policy_label(backend)
+        # Fall back to the declaration's own value rather than to silence: a kind or
+        # a reach this build's phrasing does not name is still a fact, and printing
+        # the raw word keeps the row honest until the phrase is written.
+        parts = [_PROJECTION_PHRASE.get(ability.projection) or _safe_display(ability.projection)]
+        if ability.per_tool_deny:
+            parts.append(
+                _DENY_PHRASE.get(ability.per_tool_deny) or _safe_display(ability.per_tool_deny)
+            )
+        if ability.withheld:
+            named = ", ".join(keys.get(cid, cid) for cid in ability.withheld)
+            parts.append(f"not sent from your agent file: {named}")
+        if ability.no_channel:
+            named = ", ".join(keys.get(cid, cid) for cid in ability.no_channel)
+            parts.append(f"no channel yet: {named}")
+        print(f"    {label}: {'; '.join(parts)}")
+
+
+#: What each ``ProjectionKind`` means to someone choosing a harness.
+#:
+#: Keyed by the declaration's own wire value, never by a backend id, so a harness
+#: that joins an existing kind needs no entry. Crossing the agent-sdk boundary as
+#: plain strings is why these are spelled here rather than imported.
+_PROJECTION_PHRASE = {
+    "native": "reads your agent spec itself",
+    "mirror": "a mirror projects your agent spec onto it",
+    "external": "projected, from a module outside providers/mirrors",
+    "no-channel": "carries none of Kiro Crew's own MCP servers",
+    "broker-only": "carries the shared broker's tools, not your spec's own servers",
+}
+
+#: What each ``PerToolDeny`` reach costs when a user switches ONE tool off.
+#:
+#: The ``whole-server`` line is the one an operator meets by accident, and it is
+#: stated as a cost rather than as a mechanism for that reason.
+_DENY_PHRASE = {
+    "settings-file": "switching one tool off stays per tool, as a rule Crew writes",
+    "per-call": "switching one tool off stays per tool, refused per call",
+    "whole-server": "switching one tool off withholds the WHOLE server",
+}
+
+
 #: The ``PerToolDeny`` member whose consequence is worth a row. Compared as a
 #: plain string because the value crosses the agent-sdk boundary as one -- the
 #: enum lives in ``providers/mirrors`` and importing it here is the edge the
@@ -4216,6 +4298,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     _doctor_strict_identity(cfg)
     _doctor_mcp_gateway_daemon(issues)
     _doctor_unresolved_mcp_refs()
+    _doctor_backend_ability_cards()
     _doctor_selected_backend_projection(cfg)
 
     # ── Credentials (AWS / credential-vending MCP) ──

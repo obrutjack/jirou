@@ -1380,6 +1380,39 @@ export interface AcpBackendProbe {
    * standing fact the tool-approval line explains.
    */
   offered_by_build?: boolean
+  /**
+   * How this harness receives Crew's MCP servers, projected on the server from
+   * the declaration `providers/mirrors/registry.py` already carries
+   * (`agent_sdk/backend_mcp_ability.py`). OPTIONAL, like every other card field,
+   * because a gateway that predates it sends none.
+   *
+   * The other half of the card, and the half a membership set cannot answer: the
+   * capability lines say what the harness can DO, these say what happens to the
+   * user's own AGENT SPEC on the way to it.
+   *
+   * `projection` is `ProjectionKind`'s value (`native` / `mirror` / `external` /
+   * `no-channel` / `broker-only`) and `per_tool_deny` is `PerToolDeny`'s
+   * (`settings-file` / `per-call` / `whole-server`), each `''` where the
+   * declaration carries none. Both are rendered from a label keyed by the VALUE,
+   * never by a harness, so a harness declaring an existing kind needs no label of
+   * its own -- the same arrangement as `tool_approval`.
+   *
+   * `withheld` and `no_channel` are concern ids, and the split is the meaning: a
+   * withhold is a DECISION with a reason behind it, while no-channel is a gap the
+   * transport cannot carry today. They are stated only where they hold, so a
+   * harness that withholds nothing renders nothing.
+   *
+   * It is ADVISORY. Per-tool MCP deny is not a requirement on every provider: a
+   * harness with no per-call deny channel withholds the whole server instead, and
+   * this is where it says so before a session runs. Nothing here refuses a
+   * selection.
+   */
+  mcp?: {
+    projection: string
+    per_tool_deny: string
+    withheld: string[]
+    no_channel: string[]
+  }
 }
 
 let _sessionExpiredShown = false

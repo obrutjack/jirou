@@ -366,6 +366,16 @@ Crew tool is absent while the harness works and nothing anywhere is red. That
 shipped on four harnesses in a row, because a projection nobody had written was
 spelled the same way as a projection nobody needed.
 
+**And this appears on the card too.** The declared kind, the per-tool deny reach and
+every concern the mirror rules `withheld` or `no-channel` are read back to the
+operator — in the Agent Backend detail and as one `kirocrew doctor` row per
+selectable harness — projected by `agent_sdk/backend_mcp_ability.py` from the
+declaration alone. Same property as Stage 2's capability card: a harness with a
+`PROJECTIONS` entry renders a complete section with no card edit, no frontend edit
+and no locale edit, and a harness without one renders nothing rather than something
+wrong. The card is advisory and DECLARES: a harness whose transport has no per-call
+deny identity says so there rather than being asked to enforce one.
+
 `no-channel` is a legitimate answer here, on the same terms as dormancy: it must be
 NAMED. A selectable `no-channel` harness has to name the channel that would have to
 exist and its tracking pointer in the declaration, and be named in this document —
