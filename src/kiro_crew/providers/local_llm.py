@@ -169,7 +169,7 @@ class LocalLLMProvider(LLMProvider):
     # KiroCrew injects context in this structure every turn:
     #
     #   [AGENT SYSTEM PROMPT]
-    #   ...critical rules, skills, agent identity (~5-10K chars)...
+    #   ...critical rules, MCP tool list, agent identity (~14K chars)...
     #   [END AGENT SYSTEM PROMPT]
     #
     #   [SESSION CONTEXT — background reference only...]
@@ -179,81 +179,82 @@ class LocalLLMProvider(LLMProvider):
     #   [CURRENT USER REQUEST -- respond to this]
     #   <actual user question>
     #
-    # Strategy: keep the agent system prompt (rules), drop the session context
-    # (history/memory), keep the user question. This preserves agent behaviour
-    # while reducing tokens from ~16K to ~2K.
+    # Strategy (two passes):
+    #   Pass 1: keep agent system prompt, drop session context (~65K → ~14K)
+    #   Pass 2: if agent prompt still exceeds MAX_AGENT_PROMPT_CHARS,
+    #           keep its tail (most recent / most relevant parts)
+    #
+    # Override MAX_AGENT_PROMPT_CHARS via LOCAL_LLM_MAX_AGENT_PROMPT_CHARS env var.
+    # Default 6000 chars ≈ 1500 tokens, leaving ~2500 tokens for conversation +
+    # answer within a 4096-token LM Studio context window.
 
-    _AGENT_PROMPT_START  = "[AGENT SYSTEM PROMPT]"
-    _AGENT_PROMPT_END    = "[END AGENT SYSTEM PROMPT]"
-    _SESSION_CTX_END     = "[END OF SESSION CONTEXT]"
-    _USER_REQUEST_MARKER = "[CURRENT USER REQUEST -- respond to this]"
+    _AGENT_PROMPT_START      = "[AGENT SYSTEM PROMPT]"
+    _AGENT_PROMPT_END        = "[END AGENT SYSTEM PROMPT]"
+    _SESSION_CTX_END         = "[END OF SESSION CONTEXT]"
+    _USER_REQUEST_MARKER     = "[CURRENT USER REQUEST -- respond to this]"
+    _DEFAULT_MAX_AGENT_CHARS = 6_000
 
     def _trim_kirocrew_message(self, raw: str) -> str:
         """Structure-aware trim of KiroCrew's per-turn context injection.
 
-        KiroCrew prepends ~60K chars of agent context to every user turn.
+        KiroCrew prepends ~65K chars of agent context to every user turn.
         Without trimming this exceeds the 4096-token LM Studio context window.
 
-        This method:
-        1. Keeps [AGENT SYSTEM PROMPT]...[END AGENT SYSTEM PROMPT] — critical rules
-        2. Drops [SESSION CONTEXT]...[END OF SESSION CONTEXT] — memory/history
-        3. Keeps the actual user question after [CURRENT USER REQUEST]
+        Pass 1 — structure: keep [AGENT SYSTEM PROMPT] block, drop [SESSION CONTEXT].
+        Pass 2 — size cap: if the agent prompt is still too large, keep its tail.
 
-        Falls back to keeping the last 2000 chars if the markers are not found,
-        with an explicit WARNING (marker may have changed upstream).
+        Falls back to last-N-chars if markers are not found (upstream change),
+        with an explicit WARNING.
         """
         user_req_idx = raw.find(self._USER_REQUEST_MARKER)
 
-        # ── Fast path: no KiroCrew marker at all ─────────────────────────────
+        # ── Fast path: no KiroCrew marker ────────────────────────────────────
         if user_req_idx == -1:
             if len(raw) > 10_000:
                 logger.warning(
                     "[LocalLLM] ⚠️ Large message (%d chars) without KiroCrew user-request "
                     "marker — passing through unchanged. If LM Studio rejects with "
-                    "'context too long', the marker may have changed upstream. "
-                    "See issue #6.",
+                    "'context too long', the marker may have changed upstream.",
                     len(raw),
                 )
             return raw
 
         user_request = raw[user_req_idx + len(self._USER_REQUEST_MARKER):].strip()
+        original_chars = len(raw[:user_req_idx])
 
-        # ── Structure-aware trim ──────────────────────────────────────────────
+        # ── Pass 1: extract agent system prompt, drop session context ─────────
         agent_start = raw.find(self._AGENT_PROMPT_START)
         agent_end   = raw.find(self._AGENT_PROMPT_END)
 
         if agent_start != -1 and agent_end != -1:
-            # Extract the agent system prompt block (rules + skills)
             agent_block = raw[agent_start: agent_end + len(self._AGENT_PROMPT_END)].strip()
-
-            original_chars = len(raw[:user_req_idx])
-            kept_chars     = len(agent_block)
+        else:
+            # Fallback: if agent prompt markers are missing, use entire context
+            # and let pass 2 cap it.
+            agent_block = raw[:user_req_idx].strip()
             logger.warning(
-                "[LocalLLM] ✂️ Smart trim: %d → %d chars "
-                "(kept agent system prompt, dropped session context). "
-                "See issue #6.",
-                original_chars, kept_chars,
+                "[LocalLLM] ⚠️ Agent-prompt markers not found — using full context "
+                "block for pass-2 capping. Marker text may have changed upstream.",
             )
-            return f"{agent_block}\n\n{user_request}"
 
-        # ── Fallback: markers not found, keep last N chars ────────────────────
-        # This path fires if KiroCrew upstream changed the marker text.
-        max_chars    = int(_env("LOCAL_LLM_MAX_CONTEXT_CHARS", "2000"))
-        context_block = raw[:user_req_idx].strip()
-        if len(context_block) > max_chars:
-            trimmed = context_block[-max_chars:]
+        # ── Pass 2: cap agent prompt size ─────────────────────────────────────
+        max_agent = int(_env("LOCAL_LLM_MAX_AGENT_PROMPT_CHARS",
+                             str(self._DEFAULT_MAX_AGENT_CHARS)))
+        if len(agent_block) > max_agent:
+            # Keep the tail — critical rules are near the end of the agent prompt
+            trimmed = agent_block[-max_agent:]
             nl = trimmed.find("\n")
             if nl != -1:
                 trimmed = trimmed[nl + 1:]
-            logger.warning(
-                "[LocalLLM] ⚠️ Fallback trim: agent-prompt markers not found — "
-                "keeping last %d chars of context. Marker text may have changed "
-                "upstream. Original: %d chars. See issue #6.",
-                max_chars, len(context_block),
-            )
-            context_block = trimmed
+            agent_block = trimmed
 
-        return f"{context_block}\n\n{user_request}" if context_block else user_request
+        logger.warning(
+            "[LocalLLM] ✂️ Smart trim: %d → %d chars "
+            "(kept agent system prompt tail, dropped session context). "
+            "Adjust LOCAL_LLM_MAX_AGENT_PROMPT_CHARS if needed.",
+            original_chars, len(agent_block),
+        )
+        return f"{agent_block}\n\n{user_request}"
 
     # ── Core: stream ──────────────────────────────────────────────────────────
 
