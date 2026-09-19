@@ -976,7 +976,14 @@ class TestSchemaInit:
         monkeypatch.setattr(
             vm.sqlite3,
             "connect",
-            lambda *a, **k: (events.append("connect"), real_connect(*a, **k))[1],
+            lambda *a, **k: (
+                events.append(
+                    "probe_readonly"
+                    if k.get("uri") and str(a[0]).endswith("?mode=ro")
+                    else "connect"
+                ),
+                real_connect(*a, **k),
+            )[1],
         )
         store = VectorMemoryStore(db_path=db_path)
         try:
@@ -984,7 +991,8 @@ class TestSchemaInit:
         finally:
             store.close()
 
-        assert "connect" in events, events
+        assert events.count("probe_readonly") == 1, events
+        assert events.count("connect") == 1, events
         restricted_db_before = events.index("restrict:mem.db") < events.index("connect")
         assert restricted_db_before, events
 
