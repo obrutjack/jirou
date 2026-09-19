@@ -11746,3 +11746,78 @@ class TestPerHeadMonotonicFloor:
             )
             == 1
         )
+
+
+class TestForkLaneBunEgress:
+    """The fork reviewers install bun from a GitHub *release asset*.
+
+    `anthropics/claude-code-action` runs `oven-sh/setup-bun`, which downloads
+    `https://github.com/oven-sh/bun/releases/download/...`. GitHub answers that
+    with a 302 to `release-assets.githubusercontent.com` -- a different host
+    from the `objects.githubusercontent.com` these allowlists already carry. A
+    lane that blocks egress without it does not fail at the model call: bun
+    never lands, the action's own script dies `bun: command not found`
+    (exit 127), the lane posts `review incomplete`, and because `PR Readiness`
+    aggregates these lanes, every fork PR goes red at once.
+
+    `workflow_run` lanes always execute the DEFAULT branch's copy of the yaml,
+    so a PR editing these files cannot exercise its own change. This test is
+    the only pre-merge guard the coupling has.
+    """
+
+    ENDPOINT = "release-assets.githubusercontent.com:443"
+    ACTION = "anthropics/claude-code-action"
+
+    @staticmethod
+    def _jobs(lane: str) -> dict:
+        return yaml.safe_load((WORKFLOWS / lane).read_text(encoding="utf-8"))["jobs"]
+
+    @classmethod
+    def _runs_a_model(cls, job: dict) -> bool:
+        return any(cls.ACTION in str(step.get("uses") or "") for step in job.get("steps") or ())
+
+    @staticmethod
+    def _blocking_endpoints(job: dict) -> list[str] | None:
+        """The job's blocking-egress endpoint list, or None when it does not block."""
+        for step in job.get("steps") or ():
+            if "step-security/harden-runner" not in str(step.get("uses") or ""):
+                continue
+            settings = step.get("with") or {}
+            if settings.get("egress-policy") != "block":
+                return None
+            return str(settings.get("allowed-endpoints") or "").split()
+        return None
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_every_model_job_allows_the_bun_release_asset_host(self, lane: str) -> None:
+        checked = 0
+        for name, job in self._jobs(lane).items():
+            if not self._runs_a_model(job):
+                continue
+            endpoints = self._blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            checked += 1
+            assert self.ENDPOINT in endpoints, (
+                f"{lane} job {name!r} runs {self.ACTION} behind a blocking egress "
+                f"policy but does not allow {self.ENDPOINT}, so setup-bun's download "
+                "is refused and the step exits 127 instead of reviewing anything"
+            )
+        assert checked, f"{lane} has no blocking-egress {self.ACTION} job to check"
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_jobs_that_run_no_model_keep_the_narrower_allowlist(self, lane: str) -> None:
+        # Least privilege: only the job that actually downloads bun gets the
+        # host. `fork-security-scope-review.yml` blocks egress in four jobs and
+        # runs the model in exactly one, so a blanket per-file edit would widen
+        # three allowlists that fetch nothing but Actions artifacts.
+        for name, job in self._jobs(lane).items():
+            if self._runs_a_model(job):
+                continue
+            endpoints = self._blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            assert self.ENDPOINT not in endpoints, (
+                f"{lane} job {name!r} runs no model and downloads no bun, so "
+                f"allowing {self.ENDPOINT} widens its egress for nothing"
+            )
