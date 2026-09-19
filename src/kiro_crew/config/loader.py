@@ -5377,12 +5377,12 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
 
-        Jirou fork extension: when ``agent.provider`` is ``"openai-compatible"``,
+        Fork extension: when ``agent.provider`` is ``"openai-compatible"``,
         returns an ``OpenAICompatibleProvider`` factory instead.  This covers
         LM Studio, Ollama and any BYOK cloud endpoint without touching the ACP
         layer.  See ``src/kiro_crew/providers/openai_compatible.py`` for details.
         """
-        # ── Jirou: openai-compatible provider (fork-only extension) ──────────
+        # ── Fork extension: openai-compatible provider ──────────────────────
         if self.agent.provider == "openai-compatible":
             from kiro_crew.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -5393,7 +5393,7 @@ class KiroCrewConfig:
                 return OpenAICompatibleProvider(session_key=session_key)
 
             return _openai_compat
-        # ── /Jirou extension ─────────────────────────────────────────────────
+        # ── /Fork extension ────────────────────────────────────────────────────
 
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader

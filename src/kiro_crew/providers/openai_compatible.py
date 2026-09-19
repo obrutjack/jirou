@@ -1,4 +1,4 @@
-"""OpenAI-compatible provider for Jirou (obrutjack/jirou fork of KiroCrew).
+"""OpenAI-compatible provider — fork extension for KiroCrew.
 
 Connects KiroCrew to any OpenAI-compatible API endpoint:
   - LM Studio  (default: http://localhost:1234/v1)
@@ -115,7 +115,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self._client = AsyncOpenAI(
             base_url=self._base_url,
             api_key=self._api_key,
-            timeout=90.0,
+            timeout=300.0,
         )
         self._messages = [{"role": "system", "content": self._system_prompt()}]
 
@@ -136,22 +136,114 @@ class OpenAICompatibleProvider(LLMProvider):
 
     # ── Core: stream ──────────────────────────────────────────────────────────
 
+    # Markers KiroCrew uses to wrap the user's actual request
+    _USER_REQUEST_MARKER = "[CURRENT USER REQUEST -- respond to this]"
+    _AGENT_PROMPT_END    = "[END AGENT SYSTEM PROMPT]"
+
+    # Max chars to keep from the injected context block (before the user request).
+    # ~2000 chars ≈ 500 tokens — enough for date/identity/critical rules,
+    # small enough to keep prefill fast on local hardware.
+    # Override with OPENAI_COMPAT_MAX_CONTEXT_CHARS env var.
+    _DEFAULT_MAX_CONTEXT_CHARS = 2_000
+
+    def _split_kirocrew_message(self, raw: str) -> tuple[str, str]:
+        """Split KiroCrew's injected context from the actual user request.
+
+        KiroCrew prepends ~60K chars of agent context to every user turn:
+          [AGENT SYSTEM PROMPT] ... [END AGENT SYSTEM PROMPT]
+          [SESSION CONTEXT] ... [END OF SESSION CONTEXT]
+          [CURRENT USER REQUEST -- respond to this]
+          <actual user question>
+
+        Returns (trimmed_context, actual_user_request).
+        If the marker is not found, returns ("", raw) — no trimming.
+        """
+        marker = self._USER_REQUEST_MARKER
+        idx = raw.find(marker)
+        if idx == -1:
+            return "", raw  # not a KiroCrew-format message, pass through unchanged
+
+        context_block = raw[:idx].strip()
+        user_request  = raw[idx + len(marker):].strip()
+
+        # Trim the context block to the configured max
+        max_chars = int(_env("OPENAI_COMPAT_MAX_CONTEXT_CHARS",
+                             str(self._DEFAULT_MAX_CONTEXT_CHARS)))
+        if len(context_block) > max_chars:
+            # Keep a tail — the most recent/relevant parts are usually at the end
+            trimmed = context_block[-max_chars:]
+            # Find first newline to avoid splitting mid-line
+            nl = trimmed.find("\n")
+            if nl != -1:
+                trimmed = trimmed[nl + 1:]
+            context_block = f"[context trimmed to last {max_chars} chars]\n{trimmed}"
+
+        return context_block, user_request
+
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         """Send a user message and yield KiroCrew LLMEvents."""
         if not self._client:
             await self.start()
 
-        self._messages.append({"role": "user", "content": message})
+        # ── Extract actual user request from KiroCrew's injected context ─────
+        # KiroCrew bundles ~60K chars of agent context into the user message.
+        # We split it: trimmed context → appended to system message,
+        # actual question → user message. This keeps prefill small.
+        context_block, actual_request = self._split_kirocrew_message(message)
+
+        if context_block:
+            # Prepend trimmed context to the system message for this turn
+            sys_msg = self._messages[0] if self._messages else None
+            if sys_msg and sys_msg.get("role") == "system":
+                augmented_system = (
+                    sys_msg["content"]
+                    + f"\n\n[Injected context]\n{context_block}"
+                )
+                # Replace system message for this call only (don't persist)
+                messages_for_call = [
+                    {"role": "system", "content": augmented_system},
+                    *self._messages[1:],
+                    {"role": "user", "content": actual_request},
+                ]
+            else:
+                messages_for_call = [
+                    *self._messages,
+                    {"role": "user", "content": actual_request},
+                ]
+        else:
+            messages_for_call = [
+                *self._messages,
+                {"role": "user", "content": message},
+            ]
+
+        self._messages.append({"role": "user", "content": actual_request or message})
+
+        # ── Context size diagnostic ───────────────────────────────────────────
+        total_chars = sum(
+            len(str(m.get("content") or "")) + len(str(m.get("role") or ""))
+            for m in messages_for_call
+        )
+        estimated_tokens = total_chars // 4
+        logger.warning(
+            "[OpenAICompat] 📊 Prompt stats: %d messages, ~%d chars, ~%d tokens (estimated) | model=%s",
+            len(messages_for_call), total_chars, estimated_tokens, self._model,
+        )
+        for i, m in enumerate(messages_for_call):
+            c = str(m.get("content") or "")
+            logger.warning(
+                "[OpenAICompat]   msg[%d] role=%s chars=%d (first 80: %r)",
+                i, m.get("role"), len(c), c[:80],
+            )
 
         assistant_text = ""
-        tool_calls_buf: dict[int, dict] = {}  # index -> accumulated tool call
+        tool_calls_buf: dict[int, dict] = {}
 
         try:
             async with await self._client.chat.completions.create(
                 model=self._model,
-                messages=self._messages,
+                messages=messages_for_call,
                 stream=True,
-                timeout=90.0,
+                timeout=300.0,
             ) as stream:
                 async for chunk in stream:
                     delta = chunk.choices[0].delta if chunk.choices else None
@@ -253,10 +345,51 @@ class OpenAICompatibleProvider(LLMProvider):
     def served_model(self) -> str:
         return self._model
 
+    def context_window_tokens(self) -> int:
+        """Report the model's context window to KiroCrew so it scales down context injection.
+
+        KiroCrew's context budget is proportional to model_window / 1,000,000.
+        For Qwen3 14B (32,768 token window):
+          budget = 165,000 × 32,768 / 1,000,000 ≈ 5,400 chars
+        vs the 1M-model default of 165,000 chars (~55K tokens).
+
+        Override via OPENAI_COMPAT_CONTEXT_WINDOW env var (default: 32768).
+        Set to 0 to fall back to KiroCrew's 1M-model default (not recommended for local).
+        """
+        raw = _env("OPENAI_COMPAT_CONTEXT_WINDOW", "32768")
+        try:
+            return int(raw)
+        except ValueError:
+            return 32_768
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _system_prompt(self) -> str:
-        """Build the system prompt, injecting /no_think for local models."""
+        """Build the system prompt for local LLM inference.
+
+        Priority order:
+          1. OPENAI_COMPAT_SYSTEM_PROMPT env var — user's custom prompt (shortest path)
+          2. Default concise prompt — works well with Qwen3 and /no_think
+
+        The KiroCrew gateway injects its own large system prompt (~14K tokens)
+        on top of this via its session context layer.  That injected block is
+        what causes slow prefill on local hardware.
+
+        To bypass that overhead, set OPENAI_COMPAT_SYSTEM_PROMPT to a short
+        instruction -- this provider's system message is the ONLY message sent
+        before the user turn, not the gateway's context block.
+
+        Note: the gateway context block is injected by KiroCrew's session layer
+        separately; this method only controls the provider's own system message.
+        """
+        # Allow full override via env var — useful for minimising prefill cost
+        custom = _env("OPENAI_COMPAT_SYSTEM_PROMPT", "")
+        if custom:
+            if self._no_think and not custom.startswith(_NO_THINK_DIRECTIVE):
+                return f"{_NO_THINK_DIRECTIVE}\n{custom}"
+            return custom
+
+        # Default: concise but capable
         base = (
             "You are a precise AI agent with access to tools. "
             "Call tools directly to complete the user's task. "
