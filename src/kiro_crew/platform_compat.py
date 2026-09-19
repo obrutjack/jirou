@@ -3655,9 +3655,12 @@ def process_matches(pid: int, needles: tuple[str, ...]) -> bool:
 
     Used to guard against PID recycling before killing a tracked process.
     Linux: ``/proc/<pid>/cmdline``. macOS: ``ps -o command=``.
-    Windows: the image name from ``CreateToolhelp32Snapshot`` (full command
-    line is not cheaply available; the ``.exe`` name suffices for matching
-    ``kiro-cli`` / ``claude``). Returns False on any failure.
+    Windows: the image name from ``CreateToolhelp32Snapshot`` (the full command
+    line is not cheaply available). A harness hosted by an interpreter reads as
+    that interpreter's image there — a Node-hosted ACP adapter is ``node.exe`` —
+    so a needle naming the adapter itself cannot match on Windows, and a caller
+    that needs a per-harness answer reads a recorded start identity instead
+    (``get_process_start_id``). Returns False on any failure.
     """
     try:
         if sys.platform == "linux":

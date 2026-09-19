@@ -4049,6 +4049,303 @@ class TestPidStartTokenIdentityGuard:
         assert kills == [], f"recycled PID was killed: {kills}"
 
 
+class TestReclaimOwnsEveryHarnessItTracked:
+    """A recorded start token settles reclaim identity for any tracked argv.
+
+    ``_MANAGED_AGENT_MARKERS`` is a resemblance test over two names while Crew
+    tracks eight harnesses, so a reclaim arm that gates on it alone answers
+    "not ours" for a codex-acp / opencode / pi-acp / goose / dsh orphan. Both
+    arms take the prune branch on that answer, which drops the tracking entry
+    every sweep mechanism keys off to find the process — sparing the orphan and
+    forgetting it. The token identifies any of them exactly, so a match decides
+    and the marker list is what a token-less entry falls back to.
+    """
+
+    @staticmethod
+    def _dead_gateway_liveness(gw_pid: int) -> "object":
+        def fake_liveness(pid: int) -> str:
+            return platform_compat.PID_DEAD if pid == gw_pid else platform_compat.PID_ALIVE
+
+        return fake_liveness
+
+    def test_an_unrecognised_argv_orphan_is_killed_on_a_matching_token(
+        self, session_pid_file: Path
+    ) -> None:
+        """A codex-acp orphan is reaped, not pruned.
+
+        Its argv is ``node .../codex-acp``, which contains neither marker, so
+        ``_is_managed_agent_process`` answers False for a process this gateway
+        family really did spawn.
+        """
+        from kiro_crew.session_pid import cleanup_orphaned_session_roots
+
+        entry = "999999:99998:codex-token"
+        session_pid_file.write_text(entry + "\n")
+        kills: list[tuple[int, int]] = []
+
+        with (
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="codex-token"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.pid_liveness",
+                side_effect=self._dead_gateway_liveness(999999),
+            ),
+            patch("kiro_crew.session_pid.platform_compat.get_ppid", return_value=1),
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append((p, s)),
+            ),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+        ):
+            cleanup_orphaned_session_roots()
+
+        assert (99998, platform_compat.SIGKILL) in kills, (
+            "a token-confirmed orphan was not killed; the argv resemblance test "
+            "vetoed a settled identity"
+        )
+        assert entry not in session_pid_file.read_text(encoding="utf-8")
+
+    def test_a_token_less_unrecognised_argv_orphan_is_pruned_without_a_kill(
+        self, session_pid_file: Path
+    ) -> None:
+        """The token-less fallback keeps the authority it has always had."""
+        from kiro_crew.session_pid import cleanup_orphaned_session_roots
+
+        entry = "999999:99998"
+        session_pid_file.write_text(entry + "\n")
+        kills: list[tuple[int, int]] = []
+
+        with (
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch(
+                "kiro_crew.session_pid.platform_compat.pid_liveness",
+                side_effect=self._dead_gateway_liveness(999999),
+            ),
+            patch("kiro_crew.session_pid.platform_compat.get_ppid", return_value=1),
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append((p, s)),
+            ),
+        ):
+            cleanup_orphaned_session_roots()
+
+        assert kills == [], "an entry with no identity evidence authorized a kill"
+        assert entry not in session_pid_file.read_text(encoding="utf-8")
+
+    def test_a_windows_image_name_orphan_is_killed_on_its_token(
+        self, session_pid_file: Path
+    ) -> None:
+        """Windows shape: the image name cannot name a Node-hosted adapter.
+
+        ``process_matches`` reads the full cmdline on POSIX but only the image
+        name on Windows, so codex-acp, pi-acp and claude-agent-acp all read as
+        ``node.exe`` there and no basename added to the marker list could match
+        them. The creation FILETIME the token is read from works, so the token
+        is the only identity evidence available on that platform.
+        """
+        from kiro_crew.session_pid import cleanup_orphaned_session_roots
+
+        entry = "999999:99998:filetime-token"
+        session_pid_file.write_text(entry + "\n")
+        tree_kills: list[tuple[int, int]] = []
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True),
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="filetime-token"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.pid_liveness",
+                side_effect=self._dead_gateway_liveness(999999),
+            ),
+            patch("kiro_crew.session_pid.platform_compat.get_ppid", return_value=1),
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_process_tree",
+                side_effect=lambda p, s: tree_kills.append((p, s)),
+            ),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+        ):
+            cleanup_orphaned_session_roots()
+
+        assert (99998, platform_compat.SIGKILL) in tree_kills, (
+            "a Node-hosted adapter orphan was spared on Windows, where the image "
+            "name can never satisfy the marker list"
+        )
+        assert entry not in session_pid_file.read_text(encoding="utf-8")
+
+    def test_the_periodic_sweep_keeps_an_unrecognised_argv_orphan_as_a_candidate(
+        self, session_pid_file: Path
+    ) -> None:
+        """The periodic arm reaches the same verdict as the startup arm."""
+        from kiro_crew.session_pid import _periodic_pid_sweep
+
+        my_gw = os.getpid()
+        entry = f"{my_gw}:99998:opencode-token"
+        session_pid_file.write_text(entry + "\n")
+
+        with (
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="opencode-token"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.pid_liveness",
+                return_value=platform_compat.PID_ALIVE,
+            ),
+            patch("kiro_crew.session_pid._pid_in_spawn_grace", return_value=False),
+        ):
+            killed_or_dead, candidates = _periodic_pid_sweep(my_gw, set())
+
+        assert 99998 in candidates, "a token-confirmed orphan was not offered for the kill"
+        assert entry not in killed_or_dead, "the entry was pruned instead of swept"
+
+    def test_a_confirmed_root_authorizes_its_unrecognised_descendants(self) -> None:
+        """The fleet under a confirmed root is reaped by walking the tree.
+
+        A harness starts its MCP servers from its own configuration, so their
+        argv resembles nothing in the marker list. They are read from the running
+        process tree once the root's identity is settled, which makes each one a
+        child of a process that is ours — the same authority
+        ``kill_process_tree`` exercises on the deliberate-teardown path.
+        """
+        from kiro_crew.session_pid import _kill_pid_tree
+
+        kills: list[int] = []
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="stable"),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[77771, 77772]),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append(p),
+            ),
+        ):
+            total, root_killed = _kill_pid_tree(99998, identity_confirmed=True)
+
+        assert root_killed is True
+        assert sorted(kills) == [77771, 77772, 99998]
+        assert total == 3
+
+    def test_a_descendant_reallocated_since_the_tree_read_is_not_signalled(self) -> None:
+        """A confirmed root does not blanket-authorize whatever holds a PID now.
+
+        The tree is read, then each member is signalled. A child that exits in
+        between and has its PID reallocated would otherwise receive the SIGKILL
+        meant for it. Its start token is captured at the read and re-read at the
+        signal, so a changed token skips it.
+        """
+        from kiro_crew.session_pid import _kill_pid_tree
+
+        kills: list[int] = []
+        reads: list[int] = []
+
+        def token(pid: int) -> str:
+            reads.append(pid)
+            # First read is the capture at tree-read time; the second is the
+            # re-read just before the signal, by which point this PID names a
+            # different process.
+            return "original" if reads.count(pid) == 1 else "reallocated"
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.session_pid._pid_start_token", side_effect=token),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[77771]),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append(p),
+            ),
+        ):
+            _total, root_killed = _kill_pid_tree(99998, identity_confirmed=True)
+
+        assert 77771 not in kills, "signalled a PID that names a different process now"
+        assert kills == [99998]
+        assert root_killed is True
+
+    def test_the_periodic_kill_phase_reaps_a_token_confirmed_orphan(
+        self, session_pid_file: Path
+    ) -> None:
+        """The scan phase reports a PID; the kill phase must not lose the verdict.
+
+        The periodic sweep runs ``dry_run``, so its candidates carry no verdict.
+        Re-deriving it from the entry is what lets the kill phase reap a harness
+        the marker list does not recognise — and the pruned entry must be the
+        three-field line, since that text is what the write-back matches on.
+        """
+        from kiro_crew.session_pid import _kill_confirmed_and_writeback
+
+        my_gw = os.getpid()
+        entry = f"{my_gw}:99998:goose-token"
+        session_pid_file.write_text(entry + "\n")
+        kills: list[int] = []
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="goose-token"),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append(p),
+            ),
+        ):
+            killed = _kill_confirmed_and_writeback(my_gw, [99998], set())
+
+        assert kills == [99998], "the kill phase dropped the entry's recorded identity"
+        assert killed == 1
+        assert entry not in session_pid_file.read_text(encoding="utf-8"), (
+            "the three-field entry survived its own process, so the sweep meets a "
+            "dead PID there on every later pass"
+        )
+
+    def test_the_periodic_kill_phase_prunes_a_recycled_candidate(
+        self, session_pid_file: Path
+    ) -> None:
+        """A PID reallocated between the two phases is pruned, never killed."""
+        from kiro_crew.session_pid import _kill_confirmed_and_writeback
+
+        my_gw = os.getpid()
+        entry = f"{my_gw}:99998:recorded"
+        session_pid_file.write_text(entry + "\n")
+        kills: list[int] = []
+
+        with (
+            patch("kiro_crew.session_pid._pid_start_token", return_value="different"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append(p),
+            ),
+        ):
+            killed = _kill_confirmed_and_writeback(my_gw, [99998], set())
+
+        assert kills == []
+        assert killed == 0
+        assert entry not in session_pid_file.read_text(encoding="utf-8")
+
+    def test_an_unvouched_root_keeps_the_argv_gate(self) -> None:
+        """Without a caller verdict the resemblance test still decides."""
+        from kiro_crew.session_pid import _kill_pid_tree
+
+        kills: list[int] = []
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.session_pid._is_managed_agent_process", return_value=False),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[77771]),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append(p),
+            ),
+        ):
+            total, root_killed = _kill_pid_tree(99998)
+
+        assert kills == []
+        assert (total, root_killed) == (0, False)
+
+
 class TestSpawnGraceCrossPlatform:
     @_POSIX_ONLY
     def test_grace_applies_on_macos(self, monkeypatch: pytest.MonkeyPatch) -> None:

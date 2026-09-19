@@ -122,9 +122,12 @@ def _pid_start_token(pid: int) -> str | None:
     may run on the loop is governed by that tracker's exclusive file lock, not
     by this lookup — see ``AUTOSDE: no-blocking-call-on-event-loop``.)
 
-    Returns ``None`` when identity cannot be determined (Windows, or a process
-    we may not introspect). Callers MUST treat ``None`` as "unknown", never as a
-    mismatch — see the sweep call sites.
+    Returns ``None`` when identity cannot be determined, meaning a process we may
+    not introspect or a read that failed. Every platform Crew supports HAS a
+    source — ``/proc`` on Linux, ``libproc`` on macOS, the creation FILETIME on
+    Windows — so ``None`` is a failed read rather than an unsupported host.
+    Callers MUST treat ``None`` as "unknown", never as a mismatch — see the sweep
+    call sites.
 
     Note this cannot reuse ``acp.client._get_start_time``: that hashes with
     builtin ``hash()``, which is PYTHONHASHSEED-randomized per interpreter and
@@ -160,9 +163,11 @@ def _track_session_pid(pid: int) -> None:
     Entries are written as ``<gateway_pid>:<child_pid>:<start_token>`` so each
     gateway instance can identify and sweep only its own children, and so the
     sweep can verify the PID still names the SAME process before killing
-    (PID-recycle guard — see ``_pid_start_token``). When no token is available
-    (Windows, ``ps`` failure) the legacy ``<gateway_pid>:<child_pid>`` form is
-    written and the sweep falls back to cmdline + spawn-grace checks only.
+    (PID-recycle guard — see ``_pid_start_token``). A token is available on every
+    platform Crew supports, Windows included, so the legacy
+    ``<gateway_pid>:<child_pid>`` form is written only when the probe itself
+    fails; the sweep then falls back to cmdline + spawn-grace checks only, which
+    recognise two of the eight harnesses (see ``_MANAGED_AGENT_MARKERS``).
     """
     token = _pid_start_token(pid)
     prefix = f"{os.getpid()}:{pid}"
@@ -232,6 +237,16 @@ def _rewrite_pid_file(path: Path, content: str) -> bool:
 # PIDs before a kill, and as a NEGATIVE gate in the work-orphan sweep: these
 # runtimes are reclaimed by their own tracked-PID sweep, never by the
 # marker-based work sweep (see _is_sweepable_orphan_work).
+#
+# This is a resemblance test over two names, and Crew spawns eight harnesses:
+# codex-acp, pi-acp and claude-agent-acp run as Node entry scripts, opencode and
+# goose as their own binaries, deepseek as ``dsh``. So the tracked-PID reclaim
+# arms treat a match as a FALLBACK recycle guard and prefer the entry's recorded
+# start token, which identifies any of them exactly (see _pid_start_token). The
+# list is deliberately not grown per harness: on Windows ``process_matches`` sees
+# only the image name, so a Node-hosted adapter reads as ``node.exe`` there and
+# no basename added here could match it, while the token is read from the
+# creation FILETIME and works.
 _MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude")
 
 # Exact argv0 basenames that may authorize an abandoned-scope reclaim. Unlike
@@ -311,11 +326,36 @@ def _collect_active_pids(sessions: "dict") -> tuple[set[int], bool]:
     return pids, True
 
 
-def _kill_pid_tree(pid: int) -> tuple[int, bool]:
-    """Kill *pid* and its descendant kiro-cli processes (bottom-up).
+def _kill_pid_tree(pid: int, *, identity_confirmed: bool = False) -> tuple[int, bool]:
+    """Kill *pid* and its descendant agent processes (bottom-up).
 
     Returns ``(total_killed, root_killed)`` so callers can distinguish
     whether the root process itself was sent SIGKILL.
+
+    ``identity_confirmed`` is the caller's verdict that *pid* is provably the
+    process this gateway family spawned — established by the start token the
+    tracking entry recorded (see :func:`_pid_start_token`). It defaults to
+    ``False`` so an un-vouched caller keeps the argv gate below.
+
+    The argv gate is a PID-RECYCLE guard, not an authorization boundary: it asks
+    "does this PID still name the kind of process the entry described?" and
+    :data:`_MANAGED_AGENT_MARKERS` answers for two of the eight harnesses Crew
+    spawns. A start token answers the same question for all of them, on every
+    platform, and answers it exactly rather than by resemblance — so when the
+    caller has one that matches, it decides, and the marker list is what a
+    token-less entry falls back to.
+
+    A confirmed root also authorizes its live descendants, which is how a
+    harness's MCP fleet is reaped: those processes are started by the harness from
+    its own configuration, so their argv resembles nothing a marker list holds.
+    Descendant identity is still checked, and by the same instrument as the root's
+    — each one's start token is captured when the tree is read and re-read
+    immediately before it is signalled, so a child that exited and had its PID
+    reallocated in between is skipped rather than killed. An unreadable token is
+    "identity unknown" and also skips, matching ``_is_our_child``'s
+    deny-by-default on the deliberate-teardown path. This narrows the tree-read →
+    signal window to two adjacent reads; it does not close it, and no
+    walk-then-signal design can.
     """
     if pid <= 0:
         return 0, False
@@ -326,8 +366,27 @@ def _kill_pid_tree(pid: int) -> tuple[int, bool]:
         from kiro_crew.acp.client import _get_child_pids
 
         children = _get_child_pids(pid)
+        # Captured at tree-read time, and only for the arm that reads them: an
+        # un-vouched root's children are judged by argv exactly as before, so the
+        # token probes are not paid on that path.
+        captured_tokens: dict[int, str | None] = (
+            {cpid: _pid_start_token(cpid) for cpid in children if cpid > 0}
+            if identity_confirmed
+            else {}
+        )
         for cpid in reversed(children):
-            if cpid <= 0 or not _is_managed_agent_process(cpid):
+            if cpid <= 0:
+                continue
+            if identity_confirmed:
+                recorded = captured_tokens.get(cpid)
+                if recorded is None or _pid_start_token(cpid) != recorded:
+                    logger.debug(
+                        "Skipping descendant PID %d — identity unknown or changed "
+                        "since the tree read",
+                        cpid,
+                    )
+                    continue
+            elif not _is_managed_agent_process(cpid):
                 continue
             try:
                 platform_compat.kill_pid(cpid, platform_compat.SIGKILL)
@@ -336,7 +395,7 @@ def _kill_pid_tree(pid: int) -> tuple[int, bool]:
                 pass
     except Exception:
         logger.debug("Error killing children of PID %s", pid, exc_info=True)
-    if not _is_managed_agent_process(pid):
+    if not identity_confirmed and not _is_managed_agent_process(pid):
         return killed, root_killed
     try:
         if platform_compat.IS_WINDOWS:
@@ -450,9 +509,6 @@ def _sweep_pid_entries(
             # Managed check (periodic only)
             if is_managed is not None and is_managed(pid):
                 continue
-            if not _is_managed_agent_process(pid):
-                killed_or_dead.add(stripped)
-                continue
             # ── PID-recycle identity check ──────────────────────────
             # The strongest guard: the entry recorded the child's start token
             # at spawn. If the live process's token DIFFERS, this PID has been
@@ -468,6 +524,20 @@ def _sweep_pid_entries(
             # fail-safe as _pid_gone_or_unmanaged — "any inconclusive result
             # retains"). Keep the entry and fall through to the grace check;
             # the next sweep retries.
+            #
+            # It runs AHEAD of the argv gate below because both answer the same
+            # question — "does this PID still name the process the entry
+            # described?" — and the token answers it exactly, for every harness,
+            # on every platform, while :data:`_MANAGED_AGENT_MARKERS` answers it
+            # by resemblance for two of the eight. Behind the argv gate, a
+            # confirmed orphan whose argv resembles neither marker took the
+            # prune arm: the entry was dropped as though the PID had been
+            # recycled and the process was spared, which untracks a live orphan
+            # that every sweep mechanism keys off this file to find. The same
+            # ordering argument the PPid fallback carries in
+            # :func:`cleanup_orphaned_session_roots` applies to the argv gate
+            # here: a weaker guard must not veto a settled identity.
+            identity_confirmed = False
             if recorded_token is not None:
                 live_token = _pid_start_token(pid)
                 if live_token is not None and live_token != recorded_token:
@@ -475,6 +545,13 @@ def _sweep_pid_entries(
                     continue
                 if live_token is None:
                     continue  # identity unknown — retain entry, retry next sweep
+                identity_confirmed = True
+            # Fallback recycle guard for an entry with NO recorded token: the
+            # argv resemblance test, which is the whole authority such an entry
+            # has ever carried.
+            if not identity_confirmed and not _is_managed_agent_process(pid):
+                killed_or_dead.add(stripped)
+                continue
             # ── Spawn grace period (Fix A) ──────────────────────────
             # Skip live PIDs younger than SWEEP_SPAWN_GRACE_SECONDS.
             # POSIX-wide (Linux /proc, macOS ps -o etime=); Windows: no age
@@ -486,7 +563,7 @@ def _sweep_pid_entries(
             if dry_run:
                 candidates.append(pid)
                 continue
-            total_killed, root_killed = _kill_pid_tree(pid)
+            total_killed, root_killed = _kill_pid_tree(pid, identity_confirmed=identity_confirmed)
             killed += total_killed
             if root_killed:
                 killed_or_dead.add(stripped)
@@ -551,19 +628,83 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
     return killed_or_dead, candidates
 
 
+def _session_pid_entry_index(my_gw_pid: int) -> dict[int, tuple[str, str | None]]:
+    """``{child_pid: (entry_line, recorded_token)}`` over *my_gw_pid*'s entries.
+
+    The periodic sweep runs in two phases with an event-loop hop between them, so
+    the kill phase cannot be handed a verdict computed in the scan phase and trust
+    it: the PID may have been reallocated while the loop was doing something else.
+    It re-reads what the ENTRY recorded and re-derives the verdict against the live
+    process, which is both fresher and the only thing that can be re-derived.
+
+    Returning the entry LINE matters as much as the token. Entry text is what
+    :func:`_write_back_pid_file` matches on, and a ``<gw>:<pid>`` string rebuilt
+    from parts matches only a two-field entry — so a token-bearing entry stays in
+    the file after its process is reaped, and the sweep meets a dead PID there on
+    every later pass.
+    """
+    index: dict[int, tuple[str, str | None]] = {}
+    path = _session_pid_file_path()
+    try:
+        with _session_pid_file_lock():
+            if not path.exists():
+                return index
+            lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        logger.warning("Could not read %s for the kill phase", path, exc_info=True)
+        return index
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(":")
+        if len(parts) not in (2, 3):
+            continue
+        try:
+            gw_pid = int(parts[0])
+            child_pid = int(parts[1])
+        except ValueError:
+            continue
+        if gw_pid != my_gw_pid or child_pid <= 0:
+            continue
+        recorded_token = parts[2] or None if len(parts) == 3 else None
+        index[child_pid] = (stripped, recorded_token)
+    return index
+
+
 def _kill_confirmed_and_writeback(
     my_gw_pid: int, confirmed: list[int], killed_or_dead: set[str]
 ) -> int:
-    """Phase 2b: kill confirmed orphans and write back PID file (sync, thread-safe)."""
+    """Phase 2b: kill confirmed orphans and write back PID file (sync, thread-safe).
+
+    The scan phase (``_sweep_pid_entries`` under ``dry_run``) reports PIDs, so the
+    identity verdict it reached is re-derived here from the entry's own recorded
+    token rather than inherited. Without that, every candidate reaches
+    :func:`_kill_pid_tree` un-vouched and the argv gate there spares any harness
+    the two-name marker list does not recognise — six of the eight — which is the
+    exact set the token ordering exists to reclaim, and a running gateway would
+    never reap one.
+    """
+    index = _session_pid_entry_index(my_gw_pid)
     orphan_killed = 0
     for pid in confirmed:
-        total, root = _kill_pid_tree(pid)
+        entry, recorded_token = index.get(pid, (f"{my_gw_pid}:{pid}", None))
+        identity_confirmed = False
+        if recorded_token is not None:
+            live_token = _pid_start_token(pid)
+            if live_token is None:
+                # Identity unknown: retain the entry and retry next sweep, the
+                # same fail-safe the scan phase applies.
+                continue
+            if live_token != recorded_token:
+                # Provably a different incarnation — prune, never kill.
+                killed_or_dead.add(entry)
+                continue
+            identity_confirmed = True
+        total, root = _kill_pid_tree(pid, identity_confirmed=identity_confirmed)
         orphan_killed += total
-        if root:
-            killed_or_dead.add(f"{my_gw_pid}:{pid}")
-        else:
-            if not platform_compat.pid_exists(pid):
-                killed_or_dead.add(f"{my_gw_pid}:{pid}")
+        if root or not platform_compat.pid_exists(pid):
+            killed_or_dead.add(entry)
     if killed_or_dead:
         _write_back_pid_file(killed_or_dead)
     return orphan_killed
@@ -1480,11 +1621,12 @@ def _cleanup_orphaned_mcp_servers() -> int:
 
 
 def cleanup_orphaned_sessions(*, narrow_with_leaders: bool = True) -> None:
-    """Kill leftover kiro-cli processes from a previous gateway run.
+    """Kill leftover agent-harness processes from a previous gateway run.
 
     Reads ``kiro_session_pids.txt`` (written at spawn time), validates each
-    PID still belongs to a kiro-cli process (guards against PID recycling),
-    kills descendants bottom-up, then truncates the file.
+    PID still names the process the entry recorded — by start token, falling
+    back to cmdline resemblance for a token-less entry (guards against PID
+    recycling) — kills descendants bottom-up, then truncates the file.
 
     Runs at gateway startup before any new sessions are created, so the file
     contains only PIDs from the previous run.
@@ -1693,11 +1835,12 @@ def _prune_stale_session_token_files(ttl_secs: float = _SESSION_TOKEN_TTL_SECS) 
 def cleanup_orphaned_session_roots() -> int:
     """Kill session root PIDs whose owning gateway is confirmed dead.
 
-    Reads ``kiro_session_pids.txt`` entries (format ``<gateway_pid>:<child_pid>``),
-    checks if the gateway PID is alive, and for dead gateways validates the
-    child PID is still a kiro-cli process (PID-reuse guard via
-    ``_is_managed_agent_process`` and PPid reparent-to-init check) before
-    issuing SIGKILL.
+    Reads ``kiro_session_pids.txt`` entries (format
+    ``<gateway_pid>:<child_pid>[:<start_token>]``), checks if the gateway PID is
+    alive, and for dead gateways validates the child PID still names the process
+    the entry recorded (PID-reuse guard: the recorded start token, falling back
+    to ``_is_managed_agent_process`` plus a PPid reparent-to-init check for a
+    token-less entry) before issuing SIGKILL.
 
     Called periodically from ``session.py``'s ``_cleanup_loop`` to reap
     kiro-cli processes left behind by crashed gateway instances.
@@ -1768,12 +1911,9 @@ def cleanup_orphaned_session_roots() -> int:
         if child_liveness == platform_compat.PID_UNSIGNALABLE:
             continue  # can't signal — skip
 
-        # Child is alive. Guard against PID reuse: verify it's still a
-        # managed agent process (kiro-cli/claude in cmdline).
-        if not _is_managed_agent_process(child_pid):
-            # PID was recycled by an unrelated process — prune entry
-            entries_to_remove.add(stripped)
-            continue
+        # Child is alive. Guard against PID reuse with the entry's own start
+        # token, and fall back to argv resemblance plus PPid only for an entry
+        # that carries no token.
 
         # Strongest PID-reuse guard FIRST: the entry recorded the child's start
         # token at spawn (see _pid_start_token). A MISMATCH means this PID now
@@ -1802,13 +1942,20 @@ def cleanup_orphaned_session_roots() -> int:
                 continue  # identity unknown — retain entry, retry next sweep
             identity_confirmed = True
 
-        # Fallback PID-reuse guard for entries with NO recorded token (Windows,
-        # or a failed token probe at spawn): verify PPid is 1 (reparented to
-        # init) or the dead gateway PID (race window). A recycled PID would have
-        # a completely different parent. platform_compat.get_ppid returns -1 on
-        # failure (Linux /proc, macOS libproc, Windows snapshot). This is only
-        # reached when the token could not establish identity.
+        # Fallback PID-reuse guards for entries with NO recorded token (a failed
+        # token probe at spawn): argv resemblance to something Crew spawns, then
+        # PPid is 1 (reparented to init) or the dead gateway PID (race window).
+        # A recycled PID would have a completely different parent.
+        # platform_compat.get_ppid returns -1 on failure (Linux /proc, macOS
+        # libproc, Windows snapshot). Both are reached only when the token could
+        # not establish identity, and both are weaker than it: the argv test
+        # recognises two of the eight harnesses Crew spawns, and an orphan does
+        # not always reparent to init.
         if not identity_confirmed:
+            if not _is_managed_agent_process(child_pid):
+                # PID was recycled by an unrelated process — prune entry
+                entries_to_remove.add(stripped)
+                continue
             try:
                 actual_ppid = platform_compat.get_ppid(child_pid)
             except Exception:
@@ -1820,7 +1967,7 @@ def cleanup_orphaned_session_roots() -> int:
                 continue
 
         # Confirmed orphan: kill the process tree
-        total_killed, root_killed = _kill_pid_tree(child_pid)
+        total_killed, root_killed = _kill_pid_tree(child_pid, identity_confirmed=identity_confirmed)
         killed += total_killed
         if root_killed:
             entries_to_remove.add(stripped)

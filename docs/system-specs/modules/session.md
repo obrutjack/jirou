@@ -2458,14 +2458,45 @@ untracked orphans and SIGKILLed them mid-chat (surfacing as
 
 ### Cross-platform process management (platform_compat)
 
+### Reclaim identity: token first, marker list as fallback
+
+`kiro_session_pids.txt` entries are swept by `_sweep_pid_entries` (periodic, in
+two phases) and `cleanup_orphaned_session_roots` (startup). Both decide "is this
+PID still the process the entry named?" with the recorded start token FIRST: a
+mismatch proves recycling and prunes without killing, an unreadable live token is
+"unknown" and retains the entry for the next pass, and a match settles identity.
+`process_matches(pid, ("kiro-cli","claude"))` is consulted only for an entry that
+carries no token.
+
+The ordering is what the arm is for. The marker list is a two-name resemblance
+test while Crew spawns eight harnesses — `codex-acp`, `pi-acp` and
+`claude-agent-acp` are Node entry scripts, `opencode` and `goose` their own
+binaries, deepseek is `dsh` — and on Windows `process_matches` reads only the
+image name, so an interpreter-hosted adapter reads as `node.exe` there and no
+basename added to the list could match it. Behind the marker list, a dead
+gateway's orphan of any of those harnesses answered "not ours" and took the prune
+branch, which drops the tracking entry every sweep mechanism keys off to find the
+process: the orphan was spared AND forgotten.
+
+The periodic sweep's two phases do not pass the verdict between them. The kill
+phase re-reads the entry and re-derives identity against the live process, since
+an event-loop hop separates the phases and a PID can be reallocated across it.
+
+This is a different rule from the one `kiro_pids.txt` follows above, and
+deliberately so: that arm's kill authority is the reparent heuristic, and its
+token is subtractive evidence only.
+
 All process liveness/kill/PID-file-lock operations in `session.py` and
 `session_pid.py` go through `kiro_crew.platform_compat` so KiroCrew runs natively on
 Windows as well as macOS/Linux. The critical correctness reason is that
 **`os.kill(pid, 0)` is NOT a liveness probe on Windows — it terminates the process** —
 so every liveness check uses `platform_compat.pid_exists(pid)` (or the tri-state
 `pid_liveness`) instead, kills use `kill_pid` / `kill_process_tree`, the PID-reuse
-guard reads the parent via `get_ppid`, the managed-agent check uses
-`process_matches(pid, ("kiro-cli","claude"))`, and the PID-file locks use
+guard reads the parent via `get_ppid`, the managed-agent check prefers the
+start identity an entry recorded (`get_process_start_id`, which has a source on
+all three platforms) and falls back to
+`process_matches(pid, ("kiro-cli","claude"))` only for an entry carrying no
+token, and the PID-file locks use
 `platform_compat.file_lock` / `acquire_lock` / `try_acquire_lock` (POSIX `flock`
 vs Windows `msvcrt`). On POSIX the behavior is unchanged.
 
