@@ -237,6 +237,8 @@ class OpenAICompatibleProvider(LLMProvider):
 
         assistant_text = ""
         tool_calls_buf: dict[int, dict] = {}
+        _first_token_time: float | None = None
+        _t0 = time.monotonic()
 
         try:
             async with await self._client.chat.completions.create(
@@ -245,7 +247,18 @@ class OpenAICompatibleProvider(LLMProvider):
                 stream=True,
                 timeout=300.0,
             ) as stream:
+                _stream_open_time = time.monotonic() - _t0
+                logger.warning(
+                    "[OpenAICompat] ⏱ stream opened in %.2fs",
+                    _stream_open_time,
+                )
                 async for chunk in stream:
+                    if _first_token_time is None:
+                        _first_token_time = time.monotonic() - _t0
+                        logger.warning(
+                            "[OpenAICompat] ⏱ first token in %.2fs (prefill + TTFT)",
+                            _first_token_time,
+                        )
                     delta = chunk.choices[0].delta if chunk.choices else None
                     if delta is None:
                         continue
