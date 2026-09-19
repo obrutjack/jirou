@@ -495,6 +495,15 @@ _MCP_DRAIN_REPORT_ACTIONS = frozenset(
         "mcp_oauth_request",
     }
 )
+# Starvation guard for the dispatch loop's queue drain: the longest one task
+# step may hold the event loop before it must yield. On Python 3.12
+# ``asyncio.wait_for`` runs its awaitable inline and ``Queue.get`` returns
+# without awaiting while the queue is non-empty, so a backlogged session queue
+# drains entirely inside one task step -- starving every other session, the
+# dashboard websocket and the loop-stall heartbeat for the whole drain. Budgeted
+# by wall clock rather than frame count because per-frame consumer cost varies
+# by orders of magnitude, and loop-held time is the quantity that matters.
+_DRAIN_YIELD_AFTER_S = 0.05
 _SENTINEL = object()
 
 
@@ -2928,6 +2937,7 @@ class AcpSessionHandle:
         parked_at_own_data = parked_at_data
 
         _buffered: list[JsonRpcMessage] = []
+        _last_yield = time.monotonic()
         try:
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
@@ -3022,6 +3032,22 @@ class AcpSessionHandle:
                         usage=self.last_prompt_stats.to_turn_usage(),
                     )
                     return
+
+                # Cooperative yield, placed where the previous frame is fully
+                # handled and the next one is not yet dequeued: every branch
+                # below either runs to the bottom of the loop body or takes a
+                # `continue`, so no dequeued frame is held in a local here and
+                # both watchdog clocks are already updated. A cancellation
+                # landing on this yield therefore drops nothing -- a yield
+                # placed right after the dequeue instead would strand the frame
+                # in hand, terminal response and death sentinel included. The
+                # 5s TimeoutError branch below cannot serve as the yield point
+                # either: it fires only on an EMPTY queue, so it is dead during
+                # exactly the backlog it would need to guard.
+                _now = time.monotonic()
+                if _now - _last_yield >= _DRAIN_YIELD_AFTER_S:
+                    await asyncio.sleep(0)
+                    _last_yield = time.monotonic()
 
                 try:
                     msg = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 5.0))

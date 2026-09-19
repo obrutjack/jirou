@@ -41,6 +41,14 @@ SLACK_STACK = [
     f'  File "{_SITE}/slack/gateway.py", line 5219 in _handle_message',
     f'  File "{_SITE}/slack/handler.py", line 3397 in handle',
 ]
+# The Mesh-3892 dump: the loop wedged inside the per-turn session event drain,
+# whose outer frames (dashboard/state.py) match no surface rule of their own.
+DISPATCH_STACK = [
+    f'  File "{_SITE}/acp/session_handle.py", line 2838 in _dispatch_events',
+    f'  File "{_SITE}/dashboard/state.py", line 6307 in run_background_turn',
+    '  File "/usr/lib/python3.12/asyncio/events.py", line 88 in _run',
+    '  File "/usr/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once',
+]
 IDLE_WORKER = [
     '  File "/usr/lib/python3.12/threading.py", line 359 in wait',
     '  File "/usr/lib/python3.12/concurrent/futures/thread.py", line 90 in _worker',

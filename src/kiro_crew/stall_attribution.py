@@ -59,6 +59,19 @@ _SURFACE_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("teams", ("/kiro_crew/teams/",), ()),
     ("webex", ("/kiro_crew/webex/",), ()),
     ("messaging", ("/kiro_crew/messaging/dispatch.py",), ()),
+    # Not an entry point but a loop: the per-turn session event drain. Listed
+    # last so any surface above still names the turn's origin when its frame is
+    # further out (the walk is bottom-up), and reached when nothing else in the
+    # stack is recognised -- which is what left a dump wedged here attributed to
+    # "unknown". The frame at the deadline may be a bystander: the watchdog dumps
+    # whoever holds the loop when the timer fires, not whoever consumed the
+    # preceding 25s, and this loop's own idle branch is reachable only from an
+    # empty queue.
+    (
+        "session event dispatch (queue drain)",
+        ("/kiro_crew/acp/session_handle.py",),
+        ("_dispatch_events",),
+    ),
 )
 
 #: Gate frames worth naming as "stuck in": the security gate and its callers.
