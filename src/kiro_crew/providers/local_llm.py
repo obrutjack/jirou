@@ -164,6 +164,97 @@ class LocalLLMProvider(LLMProvider):
             self._client = None
         self._messages = []
 
+    # ── Context trimming ──────────────────────────────────────────────────────
+
+    # KiroCrew injects context in this structure every turn:
+    #
+    #   [AGENT SYSTEM PROMPT]
+    #   ...critical rules, skills, agent identity (~5-10K chars)...
+    #   [END AGENT SYSTEM PROMPT]
+    #
+    #   [SESSION CONTEXT — background reference only...]
+    #   ...memory, lessons, steering, history (~50-55K chars)...
+    #   [END OF SESSION CONTEXT]
+    #
+    #   [CURRENT USER REQUEST -- respond to this]
+    #   <actual user question>
+    #
+    # Strategy: keep the agent system prompt (rules), drop the session context
+    # (history/memory), keep the user question. This preserves agent behaviour
+    # while reducing tokens from ~16K to ~2K.
+
+    _AGENT_PROMPT_START  = "[AGENT SYSTEM PROMPT]"
+    _AGENT_PROMPT_END    = "[END AGENT SYSTEM PROMPT]"
+    _SESSION_CTX_END     = "[END OF SESSION CONTEXT]"
+    _USER_REQUEST_MARKER = "[CURRENT USER REQUEST -- respond to this]"
+
+    def _trim_kirocrew_message(self, raw: str) -> str:
+        """Structure-aware trim of KiroCrew's per-turn context injection.
+
+        KiroCrew prepends ~60K chars of agent context to every user turn.
+        Without trimming this exceeds the 4096-token LM Studio context window.
+
+        This method:
+        1. Keeps [AGENT SYSTEM PROMPT]...[END AGENT SYSTEM PROMPT] — critical rules
+        2. Drops [SESSION CONTEXT]...[END OF SESSION CONTEXT] — memory/history
+        3. Keeps the actual user question after [CURRENT USER REQUEST]
+
+        Falls back to keeping the last 2000 chars if the markers are not found,
+        with an explicit WARNING (marker may have changed upstream).
+        """
+        user_req_idx = raw.find(self._USER_REQUEST_MARKER)
+
+        # ── Fast path: no KiroCrew marker at all ─────────────────────────────
+        if user_req_idx == -1:
+            if len(raw) > 10_000:
+                logger.warning(
+                    "[LocalLLM] ⚠️ Large message (%d chars) without KiroCrew user-request "
+                    "marker — passing through unchanged. If LM Studio rejects with "
+                    "'context too long', the marker may have changed upstream. "
+                    "See issue #6.",
+                    len(raw),
+                )
+            return raw
+
+        user_request = raw[user_req_idx + len(self._USER_REQUEST_MARKER):].strip()
+
+        # ── Structure-aware trim ──────────────────────────────────────────────
+        agent_start = raw.find(self._AGENT_PROMPT_START)
+        agent_end   = raw.find(self._AGENT_PROMPT_END)
+
+        if agent_start != -1 and agent_end != -1:
+            # Extract the agent system prompt block (rules + skills)
+            agent_block = raw[agent_start: agent_end + len(self._AGENT_PROMPT_END)].strip()
+
+            original_chars = len(raw[:user_req_idx])
+            kept_chars     = len(agent_block)
+            logger.warning(
+                "[LocalLLM] ✂️ Smart trim: %d → %d chars "
+                "(kept agent system prompt, dropped session context). "
+                "See issue #6.",
+                original_chars, kept_chars,
+            )
+            return f"{agent_block}\n\n{user_request}"
+
+        # ── Fallback: markers not found, keep last N chars ────────────────────
+        # This path fires if KiroCrew upstream changed the marker text.
+        max_chars    = int(_env("LOCAL_LLM_MAX_CONTEXT_CHARS", "2000"))
+        context_block = raw[:user_req_idx].strip()
+        if len(context_block) > max_chars:
+            trimmed = context_block[-max_chars:]
+            nl = trimmed.find("\n")
+            if nl != -1:
+                trimmed = trimmed[nl + 1:]
+            logger.warning(
+                "[LocalLLM] ⚠️ Fallback trim: agent-prompt markers not found — "
+                "keeping last %d chars of context. Marker text may have changed "
+                "upstream. Original: %d chars. See issue #6.",
+                max_chars, len(context_block),
+            )
+            context_block = trimmed
+
+        return f"{context_block}\n\n{user_request}" if context_block else user_request
+
     # ── Core: stream ──────────────────────────────────────────────────────────
 
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
@@ -171,13 +262,10 @@ class LocalLLMProvider(LLMProvider):
         if not self._client:
             await self.start()
 
-        # Append user message and build the call payload.
-        # Note: KiroCrew injects ~60K chars of agent context into the user message.
-        # context_window_tokens() reports this provider's window size so KiroCrew
-        # scales down its injection at the source (budget ∝ window / 1,000,000).
-        # We do NOT post-hoc truncate here — see issues #6 and #3 for the
-        # investigation plan to verify source-side reduction is working.
-        self._messages.append({"role": "user", "content": message})
+        # Trim KiroCrew's injected context before appending to history.
+        # Without this, the 60K+ char injection exceeds the LM Studio context window.
+        trimmed_message = self._trim_kirocrew_message(message)
+        self._messages.append({"role": "user", "content": trimmed_message})
         messages_for_call = list(self._messages)
 
         # ── Context size diagnostic ───────────────────────────────────────────
