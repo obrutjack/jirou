@@ -13,7 +13,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -102,6 +102,14 @@ class AllocationDeps:
     load_watchdog_settings: Callable[[str], object]
     advertised_model_ids: Callable[[Any], list[str]]
     model_is_unusable: Callable[[str, list[str]], bool]
+    #: Whether a stored pin belongs to the harness a provider runs on
+    #: (``model_scope.pin_applies``), and that harness's model-id namespace.
+    #: Injected rather than imported for the same reason every other model
+    #: helper here is: this module is constructed with its whole world so a test
+    #: can substitute one, and reaching for ``kiro_crew.model_scope`` directly
+    #: would make the pool's scope rule the only one a test cannot swap.
+    model_pin_applies: Callable[[str, str, Sequence[str] | None], bool]
+    provider_model_namespace: Callable[[LLMProvider], str]
     resolve_pin_spelling: Callable[[str, list[str]], str]
     to_provider_id: Callable[[str, str], str]
     to_acp_id: Callable[[str], str]
@@ -1560,7 +1568,25 @@ class SessionAllocationService:
                             except Exception:  # pragma: no cover - defensive
                                 advertised = []
                             _send_model = switch_model
-                            if advertised and self._deps.model_is_unusable(
+                            _namespace = self._deps.provider_model_namespace(provider)
+                            _foreign_scope = not self._deps.model_pin_applies(
+                                model,
+                                _namespace,
+                                advertised,
+                            )
+                            if _foreign_scope:
+                                # Harness ownership and account entitlement are
+                                # separate decisions. A foreign pin inherits this
+                                # harness's current pooled model.
+                                _send_model = ""
+                                self._deps.logger.info(
+                                    "Pool post-claim: model %s belongs to another harness, "
+                                    "not %s; leaving the claimed process on %s",
+                                    switch_model,
+                                    _namespace,
+                                    pool_model,
+                                )
+                            elif advertised and self._deps.model_is_unusable(
                                 switch_model, advertised
                             ):
                                 # A literal miss can be a stale `<namespace>::`
@@ -1574,14 +1600,14 @@ class SessionAllocationService:
                                 _send_model = self._deps.resolve_pin_spelling(
                                     switch_model, advertised
                                 )
-                            if not _send_model:
+                            if not _send_model and not _foreign_scope:
                                 self._deps.logger.warning(
                                     "Pool post-claim: model %s is not available to this "
                                     "account; leaving the claimed process on %s",
                                     switch_model,
                                     pool_model,
                                 )
-                            else:
+                            elif _send_model:
                                 await cast(Any, provider).client.set_model(_send_model)
                                 self._deps.logger.info(
                                     "Pool post-claim: switched model to %s",
