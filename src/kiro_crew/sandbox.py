@@ -576,6 +576,35 @@ _CREW_HIDDEN_DIRS: list[str] = _crew_home_entries(_CREW_HIDDEN_LEAVES)
 _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 
 
+def crew_host_runtime_leaves() -> tuple[str, ...]:
+    """Crew-home leaves whose sandbox disposition THIS module already decided.
+
+    The union of the two source lists that are not "hide it": the leaves a sandboxed
+    process must keep READ-WRITE (:data:`_CREW_SANDBOX_VISIBLE_LEAVES`) and the ones
+    it must see READ-ONLY (:data:`_CREW_READONLY_LEAVES`). Both answers are "the
+    child can read this"; only the write side differs, and neither is "absent".
+
+    Published for the ONE caller that builds a second, independent mask over the same
+    data home -- ``agent_sdk.tool_gate.adapter_hidden_credential_dirs``, the OS
+    credential mask an enforced adapter is confined by. That mask projects the whole
+    READ-GATE floor, and the floor covers a Crew runtime artifact for a different
+    reason than a credential: it stops the AGENT'S OWN FILE TOOLS from opening one,
+    while Crew's writers open it directly. Handed to a sandbox as a deny list, the
+    same entry hides the artifact from the CHILD -- which is not the reader the floor
+    was aiming at, and is the reader this module's two lists exist to serve.
+
+    So the mask must subtract this set rather than override it. Subtracting is not a
+    hole: the child of an unenforced harness already sees every leaf here (those
+    harnesses get no mask at all), and the read gate still fences each one from the
+    agent's file tools. The two controls keep covering different readers.
+
+    Derived, never re-spelled. A hand-copied list here would drift the moment a leaf
+    is added above, and the drift is silent in the safe-looking direction: the new
+    leaf keeps its mask entry and the enforced harnesses alone lose it.
+    """
+    return tuple(dict.fromkeys((*_CREW_SANDBOX_VISIBLE_LEAVES, *_CREW_READONLY_LEAVES)))
+
+
 def _resolved_kiro_agents_targets() -> list[str]:
     """The RESOLVED kiro agents tree — fork/template specs AND their advisory
     lock — sealed read-only as a directory.

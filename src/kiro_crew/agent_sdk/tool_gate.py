@@ -247,9 +247,12 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     step, and a floor entry added later is covered with no edit here.
 
     The harness's own credential store is excluded, because the adapter must read
-    it to authenticate. That asymmetry is intentional and safe: the floor still
-    blocks the AGENT's file tools from that leaf, so the two controls cover
-    different readers rather than cancelling each other.
+    it to authenticate. Crew's OWN runtime artifacts and ceilings are excluded too,
+    because the child has to reach them -- see
+    :func:`kiro_crew.sandbox.crew_host_runtime_leaves`, which owns that set. Both
+    asymmetries are intentional and safe: the floor still blocks the AGENT's file
+    tools from each leaf, so the two controls cover different readers rather than
+    cancelling each other.
 
     ``.ssh`` arrives through the floor and it has a cost: git-over-SSH inside such
     a session stops working, because the private key is unreadable to the child.
@@ -270,8 +273,11 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
         return ()
     # Imported here rather than at module scope: this is a LEAF that
     # ``acp/client.py`` imports at import time, and security.py is a large module
-    # whose cost belongs on the one call that needs it.
-    from kiro_crew.security import sandbox_credential_targets
+    # whose cost belongs on the one call that needs it. ``sandbox`` is deferred for
+    # the same reason -- and because it already is, one call below, for
+    # ``credential_mask_applies``.
+    from kiro_crew.sandbox import crew_host_runtime_leaves
+    from kiro_crew.security import crew_home_prefixes, sandbox_credential_targets
 
     # Delegated rather than projected under ``Path.home()`` here: a credential the
     # operator relocated with ``KIROCREW_HOME`` / ``CLAUDE_CONFIG_DIR`` /
@@ -279,7 +285,24 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     # would hand the sandbox a path that denies nothing while the live secret stayed
     # readable. ``sandbox_credential_targets`` owns the same anchor rules as the read
     # gate, so this mask cannot drift from the floor it compensates for.
-    return sandbox_credential_targets(tuple(ADAPTER_OWN_CREDENTIAL_LEAVES.get(backend, ())))
+    #
+    # The credential store's leaves are already floor-spelled. The host runtime leaves
+    # are spelled CREW-HOME-RELATIVE and gain each data-home prefix HERE, through the
+    # same ``crew_home_prefixes`` the floor projects its own entries with -- writing
+    # the product out in ``sandbox`` would be the hand-maintained spelling list this
+    # function exists to avoid, and a third data-home spelling would be covered by the
+    # floor and missed here.
+    excluded_leaves = tuple(
+        sorted(
+            set(ADAPTER_OWN_CREDENTIAL_LEAVES.get(backend, ()))
+            | {
+                f"{prefix}/{leaf}"
+                for prefix in crew_home_prefixes()
+                for leaf in crew_host_runtime_leaves()
+            }
+        )
+    )
+    return sandbox_credential_targets(excluded_leaves)
 
 
 def adapter_expose_files(backend: str, hidden: tuple) -> tuple:
