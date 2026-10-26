@@ -91,6 +91,12 @@ backend:
 test: build
 	$(PYTEST) -q
 
+# Run only the Jirou-specific tests (fast, no build required).
+# Use this after every change to local_llm.py or the config routing.
+# Requires the venv to be provisioned first (run `make backend` once).
+test-jirou:
+	$(PYTEST) test/test_local_llm_provider.py -v -n 1
+
 # --- Standalone distribution -------------------------------------------------
 
 # Self-contained pip wheel: builds + stages the dashboard, then produces a

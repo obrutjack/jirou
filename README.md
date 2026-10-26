@@ -1,3 +1,12 @@
+> **This is Jirou** — a fork of [KiroCrew](https://github.com/kirodotdev/KiroCrew) by [obrutjack](https://github.com/obrutjack).
+> Jirou extends the original with Local LLM support (LM Studio, Ollama, any OpenAI-compatible endpoint)
+> so you can run the full agent experience on your own hardware without a cloud API key.
+> Licensed under [Apache 2.0](LICENSE). Original work © Amazon.com, Inc. See [NOTICE](NOTICE) for full attribution.
+
+---
+
+<p align="center">
+
 <p align="center">
   <img src="assets/banner.svg" alt="Kiro Crew. Keep work moving. Runs on your hardware, remembers across sessions, keeps working unattended.">
 </p>
