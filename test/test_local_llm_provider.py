@@ -21,19 +21,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.providers.local_llm import (
-    LocalLLMProvider,
-    _should_inject_no_think,
-)
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
-    AcpEvent as LLMEvent,
+)
+from kiro_crew.acp.types import AcpEvent as LLMEvent
+from kiro_crew.providers.local_llm import (
+    LocalLLMProvider,
+    _should_inject_no_think,
 )
 
-
 # ─── helpers ──────────────────────────────────────────────────────────────────
+
 
 def _make_provider(**kwargs: Any) -> LocalLLMProvider:
     """Construct a LocalLLMProvider without hitting AsyncOpenAI.__init__."""
@@ -48,6 +48,7 @@ async def _drain(ait) -> list[LLMEvent]:
 
 
 # ─── _should_inject_no_think ──────────────────────────────────────────────────
+
 
 class TestShouldInjectNoThink:
     """Pure-function logic: env var wins, else model name prefix."""
@@ -89,14 +90,15 @@ class TestShouldInjectNoThink:
 
 # ─── _trim_kirocrew_message ───────────────────────────────────────────────────
 
+
 class TestTrimKiroCrewMessage:
     """Structure-aware trim: keep agent system prompt, drop session context."""
 
     # Markers used by KiroCrew (must match the constants in local_llm.py)
-    _AGENT_START   = "[AGENT SYSTEM PROMPT]"
-    _AGENT_END     = "[END AGENT SYSTEM PROMPT]"
-    _CTX_END       = "[END OF SESSION CONTEXT]"
-    _USER_MARKER   = "[CURRENT USER REQUEST -- respond to this]"
+    _AGENT_START = "[AGENT SYSTEM PROMPT]"
+    _AGENT_END = "[END AGENT SYSTEM PROMPT]"
+    _CTX_END = "[END OF SESSION CONTEXT]"
+    _USER_MARKER = "[CURRENT USER REQUEST -- respond to this]"
 
     def _build_full_message(
         self,
@@ -182,10 +184,7 @@ class TestTrimKiroCrewMessage:
         """
         provider = self._provider()
         # No AGENT SYSTEM PROMPT markers — just some context + user request
-        raw = (
-            "some context without markers\n\n"
-            f"{self._USER_MARKER}\nUser asked this."
-        )
+        raw = "some context without markers\n\n" f"{self._USER_MARKER}\nUser asked this."
         result = provider._trim_kirocrew_message(raw)
         assert "User asked this." in result
         # The full context block is used as the fallback agent prompt
@@ -200,6 +199,7 @@ class TestTrimKiroCrewMessage:
 
 
 # ─── _system_prompt ───────────────────────────────────────────────────────────
+
 
 class TestSystemPrompt:
     """/no_think directive injection and custom prompt priority."""
@@ -238,6 +238,7 @@ class TestSystemPrompt:
 
 # ─── context_window_tokens ───────────────────────────────────────────────────
 
+
 class TestContextWindowTokens:
     """Env-var parsing with graceful fallback on bad input."""
 
@@ -259,6 +260,7 @@ class TestContextWindowTokens:
 
 
 # ─── LocalLLMProvider.__init__ ────────────────────────────────────────────────
+
 
 class TestProviderInit:
     """Constructor parameter priority: explicit > env > model-name detection."""
@@ -308,6 +310,7 @@ class TestProviderInit:
 
 # ─── stream() ─────────────────────────────────────────────────────────────────
 
+
 def _make_chunk(content: str | None = None, tool_calls=None, finish_reason=None):
     """Build a minimal mock OpenAI streaming chunk."""
     delta = MagicMock()
@@ -354,9 +357,7 @@ class TestStream:
 
         mock_client = AsyncMock()
         mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
-        mock_client.chat.completions.create = AsyncMock(
-            return_value=_mock_stream(chunks)
-        )
+        mock_client.chat.completions.create = AsyncMock(return_value=_mock_stream(chunks))
         p._client = mock_client
         # Pre-seed message history so start() is skipped
         p._messages = [{"role": "system", "content": "You are helpful."}]
@@ -474,6 +475,7 @@ class TestStream:
 
 # ─── approve_tool / reject_tool ───────────────────────────────────────────────
 
+
 class TestToolApproval:
     """Interface compliance — no-op stubs must not raise."""
 
@@ -490,6 +492,7 @@ class TestToolApproval:
 
 
 # ─── config/loader.py — create_provider_factory routing ──────────────────────
+
 
 class TestConfigProviderRouting:
     """create_provider_factory() must return a LocalLLMProvider factory for local-llm.
@@ -528,11 +531,162 @@ class TestConfigProviderRouting:
         source branch logic rather than calling into the ACP factory (which
         requires a running kiro-cli process and many config attributes).
         """
-        from kiro_crew.config.loader import KiroCrewConfig
         import inspect
+
+        from kiro_crew.config.loader import KiroCrewConfig
 
         src = inspect.getsource(KiroCrewConfig.create_provider_factory)
         # The fork guard must be present and must be scoped to "local-llm" only
         assert 'self.agent.provider == "local-llm"' in src
         # The ACP path must still exist downstream of the guard
         assert "AcpProvider" in src
+
+
+# ─── Connectivity notification (Issue #12) ───────────────────────────────────
+
+
+class TestConnectivityNotification:
+    """When Local LLM is unreachable, stream() emits a visible in-chat warning
+    instead of silently failing.  Closes: https://github.com/obrutjack/jirou/issues/12
+    """
+
+    @pytest.mark.asyncio
+    async def test_unreachable_emits_warning_text_chunk(self):
+        """start() failure → stream() yields a visible warning, not silence."""
+        from openai import APIConnectionError
+
+        p = _make_provider()
+
+        with patch("kiro_crew.providers.local_llm.AsyncOpenAI") as MockOpenAI:
+            mock_client = AsyncMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.models.list = AsyncMock(side_effect=APIConnectionError(request=MagicMock()))
+            await p.start()
+
+        assert p._start_error is not None, "start_error must be set after connection failure"
+
+        # stream() must emit the warning without calling chat completions
+        p._client = mock_client
+        events = await _drain(p.stream("what is 2+2?"))
+
+        text_events = [e for e in events if e.kind == EVENT_TEXT_CHUNK]
+        assert len(text_events) >= 1, "Expected at least one TEXT_CHUNK with the warning"
+        warning_text = text_events[0].text.lower()
+        assert "unreachable" in warning_text or "not responding" in warning_text
+
+    @pytest.mark.asyncio
+    async def test_warning_ends_with_error_complete(self):
+        """stream() yields EVENT_COMPLETE stop_reason='error' after the warning."""
+        from openai import APIConnectionError
+
+        p = _make_provider()
+        with patch("kiro_crew.providers.local_llm.AsyncOpenAI") as MockOpenAI:
+            mock_client = AsyncMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.models.list = AsyncMock(side_effect=APIConnectionError(request=MagicMock()))
+            await p.start()
+
+        p._client = mock_client
+        events = await _drain(p.stream("test"))
+
+        assert events[-1].kind == EVENT_COMPLETE
+        assert events[-1].stop_reason == "error"
+
+    @pytest.mark.asyncio
+    async def test_warning_includes_endpoint_url(self):
+        """The warning names the endpoint so the user knows which server is down."""
+        from openai import APIConnectionError
+
+        custom_url = "http://localhost:9999/v1"
+        p = _make_provider(base_url=custom_url)
+
+        with patch("kiro_crew.providers.local_llm.AsyncOpenAI") as MockOpenAI:
+            mock_client = AsyncMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.models.list = AsyncMock(side_effect=APIConnectionError(request=MagicMock()))
+            await p.start()
+
+        p._client = mock_client
+        events = await _drain(p.stream("test"))
+
+        text_events = [e for e in events if e.kind == EVENT_TEXT_CHUNK]
+        assert custom_url in text_events[0].text
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_not_called_when_unreachable(self):
+        """stream() must not attempt the real LLM call when the server is down."""
+        from openai import APIConnectionError
+
+        p = _make_provider()
+        with patch("kiro_crew.providers.local_llm.AsyncOpenAI") as MockOpenAI:
+            mock_client = AsyncMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.models.list = AsyncMock(side_effect=APIConnectionError(request=MagicMock()))
+            await p.start()
+
+        p._client = mock_client
+        await _drain(p.stream("test"))
+
+        mock_client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_message_not_appended_when_unreachable(self):
+        """Unsent user messages must not accumulate in _messages when server is down."""
+        from openai import APIConnectionError
+
+        p = _make_provider()
+        with patch("kiro_crew.providers.local_llm.AsyncOpenAI") as MockOpenAI:
+            mock_client = AsyncMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.models.list = AsyncMock(side_effect=APIConnectionError(request=MagicMock()))
+            await p.start()
+
+        p._client = mock_client
+        initial_len = len(p._messages)
+        await _drain(p.stream("message that was never sent"))
+
+        # _messages must not grow: the unsent message must be discarded.
+        assert len(p._messages) == initial_len
+
+    @pytest.mark.asyncio
+    async def test_session_recovers_automatically_when_server_comes_up(self):
+        """If the server starts after the initial failure, the next stream() succeeds."""
+        from openai import APIConnectionError
+
+        p = _make_provider(no_think=False)
+        call_count = 0
+
+        async def probe_side_effect():
+            nonlocal call_count
+            call_count += 1
+            # Calls: 1 = start() probe, 2 = first stream() re-probe (still down),
+            #        3+ = second stream() re-probe (server came up)
+            if call_count <= 2:
+                raise APIConnectionError(request=MagicMock())
+            return MagicMock(data=[])
+
+        with patch("kiro_crew.providers.local_llm.AsyncOpenAI") as MockOpenAI:
+            mock_client = AsyncMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.models.list = AsyncMock(side_effect=probe_side_effect)
+            mock_client.chat.completions.create = AsyncMock(
+                return_value=_mock_stream(
+                    [_make_chunk(content="Hi there"), _make_chunk(finish_reason="stop")]
+                )
+            )
+            await p.start()
+
+        assert p._start_error is not None
+
+        p._client = mock_client
+
+        # First stream: server is still down — shows warning
+        events1 = await _drain(p.stream("first attempt"))
+        text1 = " ".join(e.text for e in events1 if e.kind == EVENT_TEXT_CHUNK).lower()
+        assert "unreachable" in text1 or "not responding" in text1
+
+        # Second stream: probe succeeds (call_count=2), warning clears, real reply arrives
+        events2 = await _drain(p.stream("second attempt"))
+        assert p._start_error is None, "_start_error must be cleared after successful reconnect"
+        text2 = " ".join(e.text for e in events2 if e.kind == EVENT_TEXT_CHUNK)
+        assert "Hi there" in text2

@@ -34,15 +34,14 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from openai import AsyncOpenAI, APIConnectionError, APIError
+from openai import APIConnectionError, APIError, AsyncOpenAI
 
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
-    EVENT_TOOL_RESULT,
-    AcpEvent as LLMEvent,
 )
+from kiro_crew.acp.types import AcpEvent as LLMEvent
 from kiro_crew.providers.base import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -50,8 +49,8 @@ logger = logging.getLogger(__name__)
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
 _DEFAULT_BASE_URL = "http://localhost:1234/v1"  # LM Studio default
-_DEFAULT_API_KEY  = "lm-studio"
-_DEFAULT_MODEL    = "qwen/qwen3-14b"
+_DEFAULT_API_KEY = "lm-studio"
+_DEFAULT_MODEL = "qwen/qwen3-14b"
 
 # /no_think disables Qwen3's extended thinking mode.
 # Benchmark: 96% tool-call success, 4.0s avg latency (vs ~39s with thinking on).
@@ -116,26 +115,30 @@ class LocalLLMProvider(LLMProvider):
         **_kwargs: Any,
     ) -> None:
         self._base_url = base_url or _env("LOCAL_LLM_BASE_URL", _DEFAULT_BASE_URL)
-        self._api_key  = api_key  or _env("LOCAL_LLM_API_KEY",  _DEFAULT_API_KEY)
-        self._model    = model    or _env("LOCAL_LLM_MODEL",     _DEFAULT_MODEL)
+        self._api_key = api_key or _env("LOCAL_LLM_API_KEY", _DEFAULT_API_KEY)
+        self._model = model or _env("LOCAL_LLM_MODEL", _DEFAULT_MODEL)
         self._session_key = session_key
 
         # /no_think: use explicit override if provided, otherwise detect from model name.
         if no_think is not None:
             self._no_think = no_think
         else:
-            self._no_think = _should_inject_no_think(
-                self._model, _env("LOCAL_LLM_NO_THINK", "")
-            )
+            self._no_think = _should_inject_no_think(self._model, _env("LOCAL_LLM_NO_THINK", ""))
 
         self._client: AsyncOpenAI | None = None
         self._messages: list[dict] = []
         self._context_pct: float = 0.0
         self._pending_tool_approvals: set = set()
+        # Set to a user-visible markdown message when the LLM endpoint is
+        # unreachable at start().  Cleared automatically on the next stream()
+        # call if the server has come up in the meantime.
+        self._start_error: str | None = None
 
         logger.info(
             "[LocalLLM] provider initialised: model=%s base_url=%s no_think=%s",
-            self._model, self._base_url, self._no_think,
+            self._model,
+            self._base_url,
+            self._no_think,
         )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -151,11 +154,19 @@ class LocalLLMProvider(LLMProvider):
 
         try:
             models = await self._client.models.list()
-            names  = [m.id for m in models.data]
+            names = [m.id for m in models.data]
             logger.info("[LocalLLM] connected; available models: %s", names[:5])
         except APIConnectionError as e:
+            self._start_error = (
+                "⚠️ **Local LLM is unreachable**\n\n"
+                f"`{self._base_url}` is not responding.\n\n"
+                "To continue:\n"
+                "- **Start LM Studio**, load a model, then send your message again"
+                " — this session will reconnect automatically.\n"
+                '- **Switch to Cloud**: set `"provider": "acp"` in your'
+                " `config.json` and restart Jirou.\n"
+            )
             logger.warning("[LocalLLM] connectivity check failed: %s", e)
-            # Non-fatal: the user may start the server after KiroCrew boots.
 
     async def shutdown(self) -> None:
         """Close the AsyncOpenAI client."""
@@ -188,10 +199,10 @@ class LocalLLMProvider(LLMProvider):
     # Default 6000 chars ≈ 1500 tokens, leaving ~2500 tokens for conversation +
     # answer within a 4096-token LM Studio context window.
 
-    _AGENT_PROMPT_START      = "[AGENT SYSTEM PROMPT]"
-    _AGENT_PROMPT_END        = "[END AGENT SYSTEM PROMPT]"
-    _SESSION_CTX_END         = "[END OF SESSION CONTEXT]"
-    _USER_REQUEST_MARKER     = "[CURRENT USER REQUEST -- respond to this]"
+    _AGENT_PROMPT_START = "[AGENT SYSTEM PROMPT]"
+    _AGENT_PROMPT_END = "[END AGENT SYSTEM PROMPT]"
+    _SESSION_CTX_END = "[END OF SESSION CONTEXT]"
+    _USER_REQUEST_MARKER = "[CURRENT USER REQUEST -- respond to this]"
     _DEFAULT_MAX_AGENT_CHARS = 6_000
 
     def _trim_kirocrew_message(self, raw: str) -> str:
@@ -219,15 +230,15 @@ class LocalLLMProvider(LLMProvider):
                 )
             return raw
 
-        user_request = raw[user_req_idx + len(self._USER_REQUEST_MARKER):].strip()
+        user_request = raw[user_req_idx + len(self._USER_REQUEST_MARKER) :].strip()
         original_chars = len(raw[:user_req_idx])
 
         # ── Pass 1: extract agent system prompt, drop session context ─────────
         agent_start = raw.find(self._AGENT_PROMPT_START)
-        agent_end   = raw.find(self._AGENT_PROMPT_END)
+        agent_end = raw.find(self._AGENT_PROMPT_END)
 
         if agent_start != -1 and agent_end != -1:
-            agent_block = raw[agent_start: agent_end + len(self._AGENT_PROMPT_END)].strip()
+            agent_block = raw[agent_start : agent_end + len(self._AGENT_PROMPT_END)].strip()
         else:
             # Fallback: if agent prompt markers are missing, use entire context
             # and let pass 2 cap it.
@@ -238,21 +249,23 @@ class LocalLLMProvider(LLMProvider):
             )
 
         # ── Pass 2: cap agent prompt size ─────────────────────────────────────
-        max_agent = int(_env("LOCAL_LLM_MAX_AGENT_PROMPT_CHARS",
-                             str(self._DEFAULT_MAX_AGENT_CHARS)))
+        max_agent = int(
+            _env("LOCAL_LLM_MAX_AGENT_PROMPT_CHARS", str(self._DEFAULT_MAX_AGENT_CHARS))
+        )
         if len(agent_block) > max_agent:
             # Keep the tail — critical rules are near the end of the agent prompt
             trimmed = agent_block[-max_agent:]
             nl = trimmed.find("\n")
             if nl != -1:
-                trimmed = trimmed[nl + 1:]
+                trimmed = trimmed[nl + 1 :]
             agent_block = trimmed
 
         logger.warning(
             "[LocalLLM] ✂️ Smart trim: %d → %d chars "
             "(kept agent system prompt tail, dropped session context). "
             "Adjust LOCAL_LLM_MAX_AGENT_PROMPT_CHARS if needed.",
-            original_chars, len(agent_block),
+            original_chars,
+            len(agent_block),
         )
         return f"{agent_block}\n\n{user_request}"
 
@@ -262,6 +275,22 @@ class LocalLLMProvider(LLMProvider):
         """Send a user message and yield KiroCrew LLMEvents."""
         if not self._client:
             await self.start()
+
+        # ── Connectivity guard ────────────────────────────────────────────────
+        # If start() could not reach the LLM endpoint, re-probe on every turn
+        # so the session recovers automatically once the user starts LM Studio.
+        if self._start_error is not None:
+            try:
+                await asyncio.wait_for(self._client.models.list(), timeout=5.0)
+                self._start_error = None  # Server is up — clear error and proceed.
+                logger.info("[LocalLLM] reconnected after earlier failure; resuming.")
+            except Exception:
+                pass  # Still unreachable — fall through to the warning below.
+
+        if self._start_error is not None:
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text=self._start_error)
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="error")
+            return
 
         # Trim KiroCrew's injected context before appending to history.
         # Without this, the 60K+ char injection exceeds the LM Studio context window.
@@ -277,13 +306,19 @@ class LocalLLMProvider(LLMProvider):
         estimated_tokens = total_chars // 4
         logger.warning(
             "[LocalLLM] 📊 Prompt stats: %d messages, ~%d chars, ~%d tokens (estimated) | model=%s",
-            len(messages_for_call), total_chars, estimated_tokens, self._model,
+            len(messages_for_call),
+            total_chars,
+            estimated_tokens,
+            self._model,
         )
         for i, m in enumerate(messages_for_call):
             c = str(m.get("content") or "")
             logger.warning(
                 "[LocalLLM]   msg[%d] role=%s chars=%d (first 80: %r)",
-                i, m.get("role"), len(c), c[:80],
+                i,
+                m.get("role"),
+                len(c),
+                c[:80],
             )
 
         assistant_text = ""
@@ -325,8 +360,8 @@ class LocalLLMProvider(LLMProvider):
                             idx = tc_delta.index
                             if idx not in tool_calls_buf:
                                 tool_calls_buf[idx] = {
-                                    "id":       "",
-                                    "type":     "function",
+                                    "id": "",
+                                    "type": "function",
                                     "function": {"name": "", "arguments": ""},
                                 }
                             buf = tool_calls_buf[idx]
