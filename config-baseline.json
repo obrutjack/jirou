@@ -300,10 +300,11 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "LLM provider backend (KiroACP / kiro-cli).",
+      "help": "LLM provider backend. \"acp\" = kiro-cli (default); \"openai-compatible\" = any OpenAI-compatible endpoint (LM Studio, Ollama, BYOK).",
       "hasChildren": false,
       "enumValues": [
-        "acp"
+        "acp",
+        "local-llm"
       ],
       "defaultValue": "acp"
     },
