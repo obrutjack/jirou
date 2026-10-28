@@ -5046,13 +5046,13 @@ class KiroCrewConfig:
         """
         # ── Fork extension: local-llm provider ──────────────────────────
         if self.agent.provider == "local-llm":
-            from kiro_crew.providers.local_llm import LocalLLMProvider
+            from kiro_crew.providers.switchable import SwitchableProvider
 
             def _local_llm(
                 session_key: str | None = None,
                 **_kwargs: object,
-            ) -> LocalLLMProvider:
-                return LocalLLMProvider(session_key=session_key)
+            ) -> SwitchableProvider:
+                return SwitchableProvider(session_key=session_key)
 
             return _local_llm
         # ── /Fork extension ────────────────────────────────────────────────────
