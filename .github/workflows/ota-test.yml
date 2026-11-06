@@ -52,7 +52,14 @@ concurrency:
 jobs:
   ota:
     name: Build two versions and prove the swap
-    runs-on: macos-latest
+    # Pinned to macos-15 rather than macos-latest: `macos-latest` currently
+    # resolves to `macos-26-arm64` (macOS Tahoe), a brand-new image with
+    # limited runner capacity. Every nightly run was queueing for ~15 minutes
+    # and failing with "The job was not acquired by Runner of type hosted even
+    # after multiple attempts" (4 annotations per run). macos-15 is arm64
+    # (Apple Silicon M2), well-established, and has reliably available capacity.
+    # Re-evaluate once macos-26 capacity stabilises.
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       PORT: "8799"
