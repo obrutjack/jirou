@@ -78,6 +78,7 @@ jobs:
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
     name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'Opus 5.5 Review' || 'Opus 5.5 Review (same-repo lane, not applicable to forks)' }}"
+    if: github.repository == 'kirodotdev/KiroCrew'  # skip on forks -- no AWS_BEDROCK_ROLE_ARN available
     runs-on: ubuntu-latest
     # Runaway/hang backstop only, NOT a per-review budget: a healthy review
     # self-terminates at --max-turns 180 per stage (two stages; see below)

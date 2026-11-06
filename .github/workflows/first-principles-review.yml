@@ -73,6 +73,7 @@ jobs:
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
     name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'First Principles Review' || 'First Principles Review (same-repo lane, not applicable to forks)' }}"
+    if: github.repository == 'kirodotdev/KiroCrew'  # skip on forks -- no AWS_BEDROCK_ROLE_ARN available
     runs-on: ubuntu-latest  # Agentic reviewer reading untrusted PR diff content -- never gets fleet credentials, same isolation as claude-review.yml/codex-review.yml.
     # Consumer counting is grep-heavy, so this lane runs more turns than the
     # other advisory lanes; keep headroom for the model-latency fat tail.
