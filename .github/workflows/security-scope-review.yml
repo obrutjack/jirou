@@ -79,6 +79,7 @@ jobs:
     # a hardcoded path. Revisit once the fence itself is CodeBuild-portable
     # (an expression, not a literal path) rather than routing this job before
     # that lands.
+    if: github.repository == 'kirodotdev/KiroCrew'  # skip on forks -- no AWS_BEDROCK_ROLE_ARN available
     runs-on: ubuntu-latest
     # OIDC for Bedrock, and read-only on the PR: this stage proposes candidates and
     # posts nothing.
