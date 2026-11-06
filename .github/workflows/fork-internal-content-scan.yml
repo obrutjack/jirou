@@ -57,9 +57,14 @@ jobs:
     name: Fork Internal Content Scan
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Upstream repo only. This workflow requires AWS OIDC credentials that only
+    # exist in kirodotdev/KiroCrew. Skip on forks so missing-credentials errors
+    # do not fire on pushes or PRs in the fork.
+    #
     # Only a SUCCESSFUL Stage 1 run that was itself a FORK pull request.
     if: >-
-      github.event.workflow_run.event == 'pull_request'
+      github.repository == 'kirodotdev/KiroCrew'
+      && github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository
     steps:
