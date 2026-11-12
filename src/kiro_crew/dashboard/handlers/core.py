@@ -2990,7 +2990,7 @@ _MODEL_PIN_PATTERN = rf"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|{QUALIFIED_MODEL_PATT
 
 
 _EDITABLE_CONFIG: dict[str, dict] = {
-    "agent.provider": {"type": "enum", "values": ["acp"]},
+    "agent.provider": {"type": "enum", "values": ["acp", "local-llm"]},  # jirou fork
     # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
     # ``values_fn`` rather than a literal, because the set WIDENS after this module
     # is imported: an edition registers a backend from
