@@ -511,16 +511,27 @@ class TestConfigProviderRouting:
         cfg.agent = agent
         return cfg
 
-    def test_local_llm_returns_local_llm_provider_factory(self):
+    def test_local_llm_factory_returns_switchable_provider(self):
+        """create_provider_factory() for 'local-llm' must return a SwitchableProvider.
+
+        The factory was updated to return SwitchableProvider (which wraps
+        LocalLLMProvider and adds /switch command support) as part of Issue #13.
+        """
+        from kiro_crew.providers.switchable import SwitchableProvider
+
         cfg = self._config_with_provider("local-llm")
         factory = cfg.create_provider_factory()
         instance = factory(session_key="test-session")
-        assert isinstance(instance, LocalLLMProvider)
+        assert isinstance(instance, SwitchableProvider)
 
     def test_local_llm_factory_passes_session_key(self):
+        """The session_key is forwarded to the SwitchableProvider."""
+        from kiro_crew.providers.switchable import SwitchableProvider
+
         cfg = self._config_with_provider("local-llm")
         factory = cfg.create_provider_factory()
         instance = factory(session_key="my-session")
+        assert isinstance(instance, SwitchableProvider)
         assert instance._session_key == "my-session"
 
     def test_acp_path_does_not_return_local_llm_provider(self):
