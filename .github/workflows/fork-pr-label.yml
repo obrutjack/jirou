@@ -34,6 +34,7 @@ concurrency:
 jobs:
   label:
     name: Label fork pull requests
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     # A few gh API calls: recent runs take under 20s at p95. The cap only stops
     # a hung run from holding a runner for GitHub's 6-hour default.

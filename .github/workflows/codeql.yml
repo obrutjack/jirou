@@ -57,6 +57,7 @@ jobs:
     # pr-readiness lists CodeQL as not eligible for them. Only the PR
     # Readiness status is required, so a skipped Analyze job blocks nothing.
     if: >-
+      github.repository == 'kirodotdev/KiroCrew' &&
       vars.CODEQL_ADVANCED_SETUP == 'true' &&
       (github.event_name != 'pull_request' ||
        (!github.event.pull_request.draft &&

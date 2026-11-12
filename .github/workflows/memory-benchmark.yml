@@ -82,6 +82,7 @@ jobs:
     # also records python / platform / sqlite / numpy and `bench compare` refuses
     # across a change in any of them, so drift this pin cannot cover becomes a
     # visible refusal rather than a false attribution.
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-24.04
     # A five-instance arm should land near ~40 min based on the measured
     # per-instance cost; 90 leaves room for a slower runner without letting a
@@ -213,7 +214,7 @@ jobs:
     needs: measure
     # `always()` so a single failed arm still yields a comparison for the arm
     # that succeeded; the steps below tolerate a missing file.
-    if: always()
+    if: github.repository == 'kirodotdev/KiroCrew' && always()
     runs-on: ubuntu-latest  # schedule/workflow_dispatch (and workflow_call inherited from a schedule caller) has no live collaborator actor for the AWS webhook allowlist to check -- stays on ubuntu-latest.
     timeout-minutes: 15
     permissions:

@@ -140,6 +140,7 @@ concurrency:
 jobs:
   sweep:
     name: Nudge stuck PR Readiness statuses
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     # Headroom for the larger dispatch volume: a real backlog can now be drained
     # in a single sweep (see MAX_DISPATCH), so the job may fire many recomputes.
