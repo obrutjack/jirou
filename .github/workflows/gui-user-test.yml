@@ -74,6 +74,7 @@ concurrency:
 jobs:
   gui-user-test:
     name: GUI User Test
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     # Boot (~4 min: npm ci + build) + every shipped scenario at ~2-4 min each
     # with one retry apiece, plus model-latency tail. The USD budget below is

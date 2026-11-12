@@ -129,7 +129,8 @@ def test_provider_enum_is_acp_only() -> None:
     A second ``agent.provider`` value would build its factory outside
     ``create_provider_factory`` and route around every invariant below it.
     """
-    assert _field_enum("provider") == ["acp"]
+    # jirou fork: extends upstream with local-llm
+    assert _field_enum("provider") == ["acp", "local-llm"]
     assert _field_default("provider") == "acp"
 
 

@@ -52,6 +52,7 @@ concurrency:
 jobs:
   ota:
     name: Build two versions and prove the swap
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: macos-latest
     timeout-minutes: 45
     env:

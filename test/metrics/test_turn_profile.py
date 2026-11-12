@@ -401,7 +401,10 @@ class TestServedBackendAttribution:
 
         provider = next(f for f in fields(AgentConfig) if f.name == "provider")
         assert provider.default == "acp"
-        assert provider.metadata["enum"] == ["acp"]
+        assert provider.metadata["enum"] == [
+            "acp",
+            "local-llm",
+        ]  # jirou fork: extends upstream with local-llm
 
     def test_label_distinguishes_the_backend_the_config_cannot(self):
         """`is_claude_backend` separates the two backends this surface can see.
