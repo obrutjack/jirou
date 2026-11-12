@@ -30,7 +30,9 @@ concurrency:
 jobs:
   smoke:
     name: Smoke providers holding a grant
-    if: vars.CONNECTIONS_L1_RUNNER != '' # empty = no seeded box; skip, never queue
+    if: >-
+      github.repository == 'kirodotdev/KiroCrew' &&
+      vars.CONNECTIONS_L1_RUNNER != '' # empty = no seeded box; skip, never queue
     runs-on: ${{ vars.CONNECTIONS_L1_RUNNER }}
     timeout-minutes: 15
     steps:

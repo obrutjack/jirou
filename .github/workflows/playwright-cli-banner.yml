@@ -28,6 +28,7 @@ permissions:
 jobs:
   check:
     name: playwright-cli banner still parses
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest  # schedule/workflow_dispatch has no live collaborator actor for the AWS webhook allowlist to check -- stays on ubuntu-latest.
     timeout-minutes: 10
     steps:

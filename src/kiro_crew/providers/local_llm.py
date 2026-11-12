@@ -37,7 +37,13 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # pragma: no cover
     from kiro_crew.trust_patterns import GrantDeadline
 
-from openai import APIConnectionError, APIError, AsyncOpenAI
+try:
+    from openai import APIConnectionError, APIError, AsyncOpenAI
+except ImportError as _openai_import_error:  # pragma: no cover
+    raise ImportError(
+        "The 'openai' package is required for local-llm support. "
+        "Install it with: pip install openai"
+    ) from _openai_import_error
 
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,

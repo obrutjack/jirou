@@ -38,6 +38,7 @@ jobs:
     # `issues`/`issue_comment` triggers, which have the identical gap. A
     # scheduled run whose actor the allowlist rejects queues forever
     # instead of running, so this job stays on `ubuntu-latest`.
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -148,6 +149,7 @@ jobs:
   # test_dependency_vulnerability_gate.py pins it that way.
   dependency-vulnerability-gate:
     name: Production Dependency Vulnerability Gate
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/dependency-vulnerability.yml
 
   # ── macOS platform tests ──────────────────────────────────────────────
@@ -181,6 +183,7 @@ jobs:
     name: Platform Tests
     permissions:
       contents: read
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/platform-tests.yml
 
   # ── Pod scenario E2E ──────────────────────────────────────────────────
@@ -199,6 +202,7 @@ jobs:
   # matrix so a future backend cannot remain silently uncovered.
   pod-scenarios:
     name: Pod Scenario E2E (${{ matrix.os }})
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -384,6 +388,7 @@ jobs:
   # about a single commit's diff.
   process-leak-invariant:
     name: Process Leak Invariant + Chaos (Linux)
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -474,6 +479,7 @@ jobs:
   build-wheel:
     name: Build Wheel
     needs: [version]
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/build-wheel.yml
     with:
       wheel_version: ${{ needs.version.outputs.wheel_version }}
@@ -481,6 +487,7 @@ jobs:
   build-desktop:
     name: Build Desktop
     needs: [version]
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/build-desktop.yml
     with:
       version: ${{ needs.version.outputs.nightly_version }}
@@ -519,6 +526,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/build-windows.yml
     with:
       version: ${{ needs.version.outputs.nightly_version }}
@@ -542,6 +550,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-cli.yml
     with:
       channel: nightly
@@ -592,6 +601,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: nightly
@@ -610,6 +620,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: nightly
@@ -628,6 +639,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: nightly
@@ -646,6 +658,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: nightly
@@ -664,6 +677,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: nightly
@@ -682,6 +696,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: nightly
@@ -725,6 +740,7 @@ jobs:
       actions: read
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-windows.yml
     with:
       channel: nightly
@@ -749,6 +765,7 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/publish-docker.yml
     with:
       channel: nightly
@@ -774,6 +791,7 @@ jobs:
       id-token: write
       contents: read
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/sign-and-notarize.yml
     # Explicit passthrough, not `secrets: inherit`: the callee declares
     # the secrets it consumes, so this hands over those and nothing
@@ -803,6 +821,7 @@ jobs:
       id-token: write
       contents: read
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/sign-and-notarize.yml
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -823,6 +842,7 @@ jobs:
       id-token: write
       contents: read
       attestations: write
+    if: github.repository == 'kirodotdev/KiroCrew'
     uses: ./.github/workflows/sign-and-notarize.yml
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}

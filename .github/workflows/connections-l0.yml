@@ -85,6 +85,7 @@ concurrency:
 jobs:
   probe:
     name: Probe official MCP static metadata
+    if: github.repository == 'kirodotdev/KiroCrew'
     runs-on: ubuntu-latest  # schedule/workflow_dispatch (and workflow_call inherited from a schedule caller) has no live collaborator actor for the AWS webhook allowlist to check -- stays on ubuntu-latest.
     timeout-minutes: 10
     steps:
